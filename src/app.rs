@@ -57,6 +57,11 @@ pub const COMMANDS: &[Command] = &[
         help: "list every Book you have added",
     },
     Command {
+        name: "/edit",
+        argument: "",
+        help: "correct the sentence on the Sighting you are on",
+    },
+    Command {
         name: "/explain",
         argument: "",
         help: "write the Note for the Sighting you are on again",
@@ -121,6 +126,12 @@ pub enum Prompt {
     Sentence {
         spelling: String,
     },
+    /// Collecting the sentence a Sighting should have been captured with. The
+    /// Sighting already exists, which is what makes this a correction rather
+    /// than a capture.
+    Correction {
+        sighting_id: i64,
+    },
     /// This Word is already held — add another Sighting for it?
     AnotherSighting {
         spelling: String,
@@ -137,6 +148,7 @@ impl Prompt {
         match self {
             Self::None => None,
             Self::Sentence { .. } => Some("sentence:".to_string()),
+            Self::Correction { .. } => Some("corrected sentence:".to_string()),
             Self::AnotherSighting { spelling } => {
                 Some(format!("add another Sighting for \"{spelling}\"? [y/n]"))
             }
@@ -148,7 +160,10 @@ impl Prompt {
 
     /// Whether this prompt takes typed text rather than a single keypress.
     fn takes_text(&self) -> bool {
-        matches!(self, Self::None | Self::Sentence { .. })
+        matches!(
+            self,
+            Self::None | Self::Sentence { .. } | Self::Correction { .. }
+        )
     }
 }
 
@@ -381,10 +396,15 @@ impl App {
     /// Escape backs out of wherever you are: a part-finished capture first,
     /// then a Screen, then to Home.
     fn cancel(&mut self) {
-        if let Prompt::Sentence { .. } = self.prompt {
+        let abandoned = match self.prompt {
+            Prompt::Sentence { .. } => Some("Capture cancelled — nothing was saved."),
+            Prompt::Correction { .. } => Some("Left as it was — the sentence is unchanged."),
+            _ => None,
+        };
+        if let Some(said) = abandoned {
             self.prompt = Prompt::None;
             self.input.clear();
-            self.inform(Tone::Info, "Capture cancelled — nothing was saved.");
+            self.inform(Tone::Info, said);
             return;
         }
 
@@ -398,35 +418,55 @@ impl App {
     }
 
     fn submit(&mut self) -> Result<()> {
-        if let Prompt::Sentence { spelling } = std::mem::replace(&mut self.prompt, Prompt::None) {
-            let sentence = self.input.trim().to_string();
-            if sentence.is_empty() {
-                // Nothing typed yet: keep collecting rather than saving a
-                // Sighting with no sentence, which is the whole point of one.
-                self.prompt = Prompt::Sentence { spelling };
-                self.inform(Tone::Warning, "Type the sentence you met the Word in.");
-                return Ok(());
+        match std::mem::replace(&mut self.prompt, Prompt::None) {
+            Prompt::Sentence { spelling } => {
+                let sentence = self.input.trim().to_string();
+                if sentence.is_empty() {
+                    // Nothing typed yet: keep collecting rather than saving a
+                    // Sighting with no sentence, which is the whole point of one.
+                    self.prompt = Prompt::Sentence { spelling };
+                    self.inform(Tone::Warning, "Type the sentence you met the Word in.");
+                    return Ok(());
+                }
+                self.input.clear();
+                self.capture(&spelling, &sentence)
             }
-            self.input.clear();
-            return self.capture(&spelling, &sentence);
-        }
+            Prompt::Correction { sighting_id } => {
+                let sentence = self.input.trim().to_string();
+                if sentence.is_empty() {
+                    // Emptying the line is not how a Sighting loses its
+                    // sentence; Escape is how it is left alone.
+                    self.prompt = Prompt::Correction { sighting_id };
+                    self.inform(Tone::Warning, "Type the sentence as the Book has it.");
+                    return Ok(());
+                }
+                self.input.clear();
+                self.correct(sighting_id, &sentence)
+            }
+            // Only the prompts above collect text, so anything else here is the
+            // bare input line.
+            _ => {
+                let input = self.input.trim().to_string();
+                if input.starts_with('/') {
+                    self.input.clear();
+                    return self.run_command(&input);
+                }
+                if input.is_empty() {
+                    // Enter on a list opens what is highlighted.
+                    return self.pick_book();
+                }
 
-        let input = self.input.trim().to_string();
-        if input.starts_with('/') {
-            self.input.clear();
-            return self.run_command(&input);
+                // Plain text is a search, and Enter opens what it found.
+                self.open_selected()
+            }
         }
-        if input.is_empty() {
-            // Enter on a list opens what is highlighted.
-            return self.pick_book();
-        }
-
-        // Plain text is a search, and Enter opens what it found.
-        self.open_selected()
     }
 
     fn input_changed(&mut self) {
-        if !self.prompt.takes_text() || matches!(self.prompt, Prompt::Sentence { .. }) {
+        // Only the bare input line searches. A sentence being typed into a
+        // prompt is not a query, and letting it run one would tear down the
+        // Screen the prompt was asked from.
+        if !matches!(self.prompt, Prompt::None) {
             return;
         }
         self.message = None;
@@ -476,6 +516,7 @@ impl App {
             "/add" => self.start_capture(argument),
             "/book" => self.switch_book(argument),
             "/library" => self.show_library(),
+            "/edit" => self.edit(),
             "/explain" => self.explain(),
             "/sync" => self.sync(),
             "/help" => {
@@ -565,6 +606,58 @@ impl App {
                 ),
             );
         }
+        Ok(())
+    }
+
+    /// Start correcting the sentence on the Sighting being looked at.
+    ///
+    /// A sentence is copied out of a book by hand, so getting one wrong is
+    /// ordinary. Before this there was no way to put one right: the Sighting
+    /// was written once and stood, and the only recourse was a second Sighting
+    /// of an encounter that only happened once.
+    fn edit(&mut self) -> Result<()> {
+        let Screen::Word(view) = &self.screen else {
+            self.inform(
+                Tone::Warning,
+                "/edit corrects a Sighting's sentence — open a Word first.",
+            );
+            return Ok(());
+        };
+        let Some(sighting) = view.sightings.get(view.selected) else {
+            self.inform(Tone::Warning, "There is no Sighting to correct.");
+            return Ok(());
+        };
+
+        // The line starts on what is already there. A correction is usually a
+        // word or two out of place, and made to retype the sentence to fix one
+        // of them the reader is doing the thing that mistyped it in the first
+        // place.
+        self.input = sighting.sentence.clone();
+        self.prompt = Prompt::Correction {
+            sighting_id: sighting.id,
+        };
+        Ok(())
+    }
+
+    /// Put right the sentence a Sighting was captured with.
+    ///
+    /// The Note is a reading of the Word *in that sentence*, so a corrected
+    /// sentence leaves the old Note explaining one that was never in the Book.
+    /// It is discarded and asked for again, exactly as `/explain` does and for
+    /// the same reason. With no key that leaves the Sighting pending rather
+    /// than wrong, and the next launch with one writes the reading the
+    /// corrected sentence deserves.
+    fn correct(&mut self, sighting_id: i64, sentence: &str) -> Result<()> {
+        self.store.correct_sentence(sighting_id, sentence)?;
+        // Sentences are searchable, so what search matches against has changed.
+        self.corpus = self.store.corpus()?;
+
+        self.store.queue_note(sighting_id)?;
+        self.ask_for_note(sighting_id)?;
+        // Re-read straight away, so the corrected sentence is on the screen the
+        // reader is already looking at rather than on their next visit.
+        self.reread_sightings()?;
+        self.inform(Tone::Info, "Sentence corrected.");
         Ok(())
     }
 

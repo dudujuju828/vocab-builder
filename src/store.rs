@@ -259,6 +259,23 @@ impl Store {
         Ok(sightings)
     }
 
+    /// Put right the sentence a Sighting was captured with.
+    ///
+    /// The sentence and nothing else. Which Word, which Book, and the day it
+    /// was met on are what the Sighting *is*; correcting a mistyped copy of the
+    /// sentence is not a second encounter, and dating it today would say it was.
+    /// The card carries the sentence, so the card is now out of date.
+    pub fn correct_sentence(&self, sighting_id: i64, sentence: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sightings SET sentence = ?2 WHERE id = ?1",
+            params![sighting_id, sentence.trim()],
+        )?;
+        if let Some(word_id) = self.word_of(sighting_id)? {
+            self.mark_card_changed(word_id)?;
+        }
+        Ok(())
+    }
+
     // -- Notes ------------------------------------------------------------
 
     /// Every Sighting still waiting for a Note, oldest first.

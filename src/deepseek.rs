@@ -25,17 +25,27 @@ const ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const MODEL: &str = "deepseek-v4-pro";
 
 /// A Note is one or two sentences; this is the ceiling, not the target.
-const MOST_TOKENS: u32 = 200;
+///
+/// Set far above what a reading actually costs — a measured one came back in
+/// 62 — so that a long sentence, or a Word that needs a clause more to place,
+/// is never cut off half-read. Unused budget is not billed, so the headroom
+/// costs nothing to carry.
+const MOST_TOKENS: u32 = 600;
 
 /// Both DeepSeek V4 models reason before they answer, and the reasoning is
 /// spent out of the same budget as the reply.
 ///
 /// A one-sentence reading of a word in a sentence does not need a reasoning
-/// trace, and with one it never arrives: the trace alone runs past
-/// [`MOST_TOKENS`], the reply comes back empty with `finish_reason` of
-/// `length`, and every Note fails. Turning it off is also what keeps a Note the
-/// single cheap round trip ADR 0004 costed — with it on, the reading above cost
-/// 292 reasoning tokens to produce 13 of answer.
+/// trace, and paying for one is the difference between a Note costing tens of
+/// tokens and hundreds: with it on, the reading above cost 292 reasoning tokens
+/// to produce 13 of answer. Turning it off is what keeps a Note the single
+/// cheap round trip ADR 0004 costed.
+///
+/// It is also what [`MOST_TOKENS`] used to be sized against. With the trace on
+/// and the ceiling at 200, the trace alone exhausted the budget: the reply came
+/// back truncated with a `finish_reason` of `length`, and every Note failed.
+/// [`read`] refuses such an answer rather than storing half of one, whatever
+/// the ceiling is set to.
 const REASONING: &str = "none";
 
 /// Long enough that a slow answer still arrives, short enough that a hung

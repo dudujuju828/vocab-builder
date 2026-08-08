@@ -206,7 +206,7 @@ fn draw_word(app: &App, frame: &mut Frame, area: Rect, view: &WordView) {
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!(
-            "↑↓ to choose a Sighting  ·  /explain rewrites its Note  ·  {}",
+            "↑↓ to choose a Sighting  ·  /edit its sentence  ·  /explain its Note  ·  {}",
             match view.origin {
                 Origin::Search { .. } => "Esc to go back to your search",
                 Origin::Home => "Esc to go back",
@@ -325,7 +325,17 @@ fn draw_message(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
+/// The input line, kept scrolled to the end of what is being typed.
+///
+/// A sentence copied out of a book is routinely longer than the terminal is
+/// wide. None of it is ever lost — the whole of what was typed is what gets
+/// submitted — but a line that simply stopped at the right edge left the reader
+/// typing blind past that point, which is precisely when a mistyped sentence
+/// has to be noticed. Scrolling costs the head of the line instead, which has
+/// already been read.
 fn draw_input(app: &App, frame: &mut Frame, area: Rect) {
+    let area = area.inner(ratatui::layout::Margin::new(2, 0));
+
     let mut spans = match app.prompt().label() {
         Some(label) => vec![Span::styled(
             format!("{label} "),
@@ -339,15 +349,20 @@ fn draw_input(app: &App, frame: &mut Frame, area: Rect) {
         Style::new().fg(Color::White),
     ));
 
+    // Measured before the hint is added, so what is held in view is the end of
+    // the typing rather than the end of a suggestion sitting after it.
+    let typed: usize = spans.iter().map(|span| span.width()).sum();
+
     if matches!(app.prompt(), Prompt::None)
         && let Some(hint) = argument_hint(app.input())
     {
         spans.push(Span::styled(hint, DIM));
     }
 
+    let scrolled = typed.saturating_sub(area.width as usize) as u16;
     frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        area.inner(ratatui::layout::Margin::new(2, 0)),
+        Paragraph::new(Line::from(spans)).scroll((0, scrolled)),
+        area,
     );
 }
 

@@ -118,3 +118,28 @@ fn escape_from_a_search_returns_to_the_opening_screen() {
 
     vocab.assert_shows("Reading Moby-Dick");
 }
+
+/// A sentence copied out of a book is routinely wider than the terminal. The
+/// end of the line is the part being typed, so that is the part that has to
+/// stay on screen — a line that stopped at the right edge left the reader
+/// typing blind into text they could not check.
+#[test]
+fn a_line_wider_than_the_terminal_shows_its_end() {
+    let mut vocab = Harness::new();
+
+    vocab.type_text(
+        "The Pequod sailed at dawn with a crew of thirty aboard her, and the fog \
+         lay so thick upon the water that the lookout could see nothing at all \
+         beyond the bowsprit.",
+    );
+
+    let line = vocab.input_line();
+    assert!(
+        line.ends_with("beyond the bowsprit."),
+        "the end of the line was scrolled off: {line:?}"
+    );
+    assert!(
+        !line.contains("The Pequod sailed at dawn"),
+        "the line was not scrolled, so it cannot all have fitted: {line:?}"
+    );
+}

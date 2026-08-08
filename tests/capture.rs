@@ -158,3 +158,23 @@ fn differing_case_reaches_the_same_word() {
 
     vocab.assert_shows("You already have");
 }
+
+/// The sentence prompt is where a long line actually turns up, since that is
+/// the one place a whole sentence is typed.
+#[test]
+fn a_long_sentence_being_typed_shows_its_end() {
+    let mut vocab = reading("Moby-Dick");
+    vocab.submit("/add cetacean");
+
+    vocab.type_text(
+        "A great cetacean surfaced beside the boat, so close that the men could \
+         see the barnacles crusting its flank, and the mate called for the harpoon \
+         before it should sound again.",
+    );
+
+    let line = vocab.input_line();
+    assert!(
+        line.ends_with("before it should sound again."),
+        "the end of the sentence was scrolled off: {line:?}"
+    );
+}
