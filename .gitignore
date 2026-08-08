@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local user database — the tool's own data, never committed
+/data
+vocab.db
+vocab.db-journal
+vocab.db-wal
+
+.env
+.scratch/
