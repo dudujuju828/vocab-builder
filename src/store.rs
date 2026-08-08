@@ -291,7 +291,7 @@ impl Store {
                     book_name: row.get(2)?,
                     captured_at: parse_time(&captured_at),
                     note: row.get(4)?,
-                    note_state: NoteState::from_str(&note_state),
+                    note_state: NoteState::from_stored(&note_state),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

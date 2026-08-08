@@ -57,9 +57,11 @@ impl NoteState {
         }
     }
 
+    /// Read a state back out of the database.
+    ///
     /// Unrecognised values are treated as pending: a Note we cannot classify is
     /// one worth attempting again, and the Sighting itself is never at risk.
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_stored(value: &str) -> Self {
         match value {
             "ready" => Self::Ready,
             "failed" => Self::Failed,
