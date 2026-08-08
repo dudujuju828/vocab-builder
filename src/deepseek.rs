@@ -10,16 +10,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Error, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::notes::{BoxedNote, NoteRequest, NoteWriter};
+use crate::notes::{BoxedNote, NoteRequest, NoteWriter, Unwritten, Written};
 
-/// The key is read from here and held in memory for the run. It is never
-/// written to the configuration file, which is why the configuration file has
-/// no place to put it.
-const API_KEY: &str = "DEEPSEEK_API_KEY";
+/// The key is read from this variable and held in memory for the run. It is
+/// never written to the configuration file, which is why the configuration file
+/// has no place to put it.
+const KEY_VARIABLE: &str = "DEEPSEEK_API_KEY";
 
 const ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const MODEL: &str = "deepseek-v4-pro";
@@ -39,8 +39,8 @@ read, so that they can learn them later.
 
 You will be given one Word, the Book it was met in, and the sentence it \
 appeared in. Reply with one or two sentences saying what that Word is doing in \
-that particular sentence: which of its senses is in play, and what it is \
-carrying there that a dictionary definition on its own would miss.
+that particular sentence: which way it is being used there, and what it is \
+carrying that a dictionary definition on its own would miss.
 
 The reader already has the dictionary definition in front of them, so do not \
 restate it. Do not greet them, do not explain what you are about to do, do not \
@@ -56,16 +56,15 @@ impl DeepSeek {
     /// The writer, or `None` when there is no key in the environment.
     ///
     /// `None` is not an error: it disables Note generation for the run, which
-    /// the tool says once at launch rather than on every capture.
+    /// the tool says once at launch rather than on every capture. A client that
+    /// cannot be built at all — a broken TLS setup — is the same condition, and
+    /// is treated the same way rather than taking the offline core down with it.
     pub fn from_environment() -> Option<Arc<dyn NoteWriter>> {
-        let key = std::env::var(API_KEY).ok()?;
+        let key = std::env::var(KEY_VARIABLE).ok()?;
         if key.trim().is_empty() {
             return None;
         }
-        let client = Client::builder()
-            .timeout(PATIENCE)
-            .build()
-            .expect("building an HTTP client");
+        let client = Client::builder().timeout(PATIENCE).build().ok()?;
         Some(Arc::new(Self { client, key }))
     }
 }
@@ -78,9 +77,9 @@ impl NoteWriter for DeepSeek {
     }
 }
 
-async fn ask(client: Client, key: String, request: NoteRequest) -> Result<String> {
+async fn ask(client: Client, key: String, request: NoteRequest) -> Written {
     let spelling = request.spelling.clone();
-    let answer = client
+    let sent = client
         .post(ENDPOINT)
         .bearer_auth(key)
         .json(&Ask {
@@ -90,24 +89,34 @@ async fn ask(client: Client, key: String, request: NoteRequest) -> Result<String
             stream: false,
         })
         .send()
-        .await
-        .with_context(|| format!("asking DeepSeek about {spelling:?}"))?;
+        .await;
 
-    // The body says far more than the status alone about why a Note failed,
-    // and a failed Note is meant to be recoverable rather than mysterious.
+    // No answer at all. Whatever the cause, the question is still worth asking,
+    // so the Sighting stays queued for a launch with a network behind it —
+    // which is what makes capturing on a train cost nothing.
+    let answer = sent.map_err(|error| {
+        Unwritten::Unreachable(
+            Error::new(error).context(format!("reaching DeepSeek about {spelling:?}")),
+        )
+    })?;
+
+    // Past here DeepSeek has answered, so anything wrong is a refusal: the
+    // reader's to ask again rather than the tool's to retry forever. The body
+    // says far more than the status alone about which refusal it was.
     let status = answer.status();
     if !status.is_success() {
         let body = answer.text().await.unwrap_or_default();
-        bail!(
+        return Err(Unwritten::Refused(anyhow!(
             "DeepSeek answered {status} for {spelling:?}: {}",
             body.trim()
-        );
+        )));
     }
 
-    let answer: Answer = answer
-        .json()
-        .await
-        .with_context(|| format!("reading DeepSeek's answer about {spelling:?}"))?;
+    let answer: Answer = answer.json().await.map_err(|error| {
+        Unwritten::Refused(
+            Error::new(error).context(format!("reading DeepSeek's answer about {spelling:?}")),
+        )
+    })?;
     let note = answer
         .choices
         .into_iter()
@@ -116,12 +125,13 @@ async fn ask(client: Client, key: String, request: NoteRequest) -> Result<String
         .unwrap_or_default();
     let note = note.trim().to_string();
 
-    // An empty Note would render as though one had been written. Better to
-    // fail, which is visible and retryable.
-    ensure!(
-        !note.is_empty(),
-        "DeepSeek had nothing to say about {spelling:?}"
-    );
+    // An empty Note would render as though one had been written. Refusing is
+    // visible and retryable; a blank line is neither.
+    if note.is_empty() {
+        return Err(Unwritten::Refused(anyhow!(
+            "DeepSeek had nothing to say about {spelling:?}"
+        )));
+    }
     Ok(note)
 }
 
@@ -168,11 +178,11 @@ struct Answer {
 
 #[derive(Deserialize)]
 struct Choice {
-    message: Spoken,
+    message: Reply,
 }
 
 #[derive(Deserialize)]
-struct Spoken {
+struct Reply {
     content: String,
 }
 

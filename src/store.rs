@@ -274,6 +274,7 @@ impl Store {
             .optional()?)
     }
 
+    /// Record the reading a writer came back with.
     pub fn write_note(&self, sighting_id: i64, note: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE sightings SET note = ?2, note_state = 'ready' WHERE id = ?1",

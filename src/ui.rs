@@ -36,7 +36,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
         Screen::Search { results, selected } => {
             draw_search(app, frame, content, results, *selected)
         }
-        Screen::Word(view) => draw_word(frame, content, view),
+        Screen::Word(view) => draw_word(app, frame, content, view),
         Screen::Library { books, selected } => draw_library(app, frame, content, books, *selected),
         Screen::Help => draw_help(frame, content),
     }
@@ -153,7 +153,7 @@ fn draw_search(
     paragraph(lines, frame, area);
 }
 
-fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
+fn draw_word(app: &App, frame: &mut Frame, area: Rect, view: &WordView) {
     let mut lines = vec![
         Line::from(Span::styled(
             view.word.spelling.clone(),
@@ -200,7 +200,7 @@ fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
             format!("  {}", sighting.sentence),
             Style::new().fg(Color::White),
         )));
-        lines.push(note_line(sighting));
+        lines.push(note_line(sighting, app.notes_are_on()));
     }
 
     lines.push(Line::raw(""));
@@ -220,7 +220,7 @@ fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
 
 /// The Note for one Sighting, labelled so it reads as a second opinion rather
 /// than as part of the Definition — and never as an empty space.
-fn note_line(sighting: &Sighting) -> Line<'static> {
+fn note_line(sighting: &Sighting, notes_are_on: bool) -> Line<'static> {
     let label = Span::styled("  Note  ", Style::new().fg(Color::Magenta));
     let body = match (sighting.note_state, &sighting.note) {
         (NoteState::Ready, Some(note)) => Span::styled(note.clone(), Style::new().fg(Color::Gray)),
@@ -228,6 +228,10 @@ fn note_line(sighting: &Sighting) -> Line<'static> {
             "couldn't be written — /explain to ask again".to_string(),
             Style::new().fg(Color::Yellow),
         ),
+        // Pending with nothing writing is still pending — the queue drains
+        // whenever a key turns up — but saying only "pending" would promise
+        // something that cannot happen this run.
+        _ if !notes_are_on => Span::styled("pending — Notes are off".to_string(), DIM),
         // A Note recorded as ready but missing is a hand-edited database; say
         // pending, which is at least true of what will happen next.
         _ => Span::styled("pending…".to_string(), DIM),

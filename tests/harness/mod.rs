@@ -14,16 +14,15 @@
 #![allow(dead_code)] // Each integration test file uses a different subset.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
-use vocab::notes::{BoxedNote, NoteRequest, NoteWriter, Notes};
+use vocab::notes::{BoxedNote, NoteRequest, NoteWriter, Notes, Unwritten};
 use vocab::{App, Dictionary, Store};
 
 const WIDTH: u16 = 100;
@@ -43,6 +42,25 @@ fn dictionary() -> Dictionary {
     Dictionary::open(&directory.join("wordnet.db")).expect("opening the bundled dictionary")
 }
 
+/// How the stub behaves when it is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answering {
+    /// Answers, every time.
+    Always,
+    /// Answers, but each answer takes longer than the one after it — so an
+    /// earlier answer always lands last, which is the ordering in which a stale
+    /// answer could overwrite the Note that replaced it.
+    Slowly,
+    /// Answers, and the answer is no.
+    Refusing,
+    /// Cannot be reached at all, as on a train.
+    Unreachable,
+}
+
+/// How many turns the slowest answer dawdles for. Anything above the number of
+/// Notes a test asks for keeps the ordering strictly reversed.
+const DAWDLE: usize = 8;
+
 /// The one fake: a `NoteWriter` that never leaves the process.
 ///
 /// The Note it returns echoes back the Word, the Book, and the sentence it was
@@ -51,34 +69,46 @@ fn dictionary() -> Dictionary {
 /// it replaced.
 pub struct StubWriter {
     attempts: AtomicUsize,
-    working: AtomicBool,
+    answering: Mutex<Answering>,
 }
 
 impl StubWriter {
-    fn new(working: bool) -> Self {
+    fn new(answering: Answering) -> Self {
         Self {
             attempts: AtomicUsize::new(0),
-            working: AtomicBool::new(working),
+            answering: Mutex::new(answering),
         }
     }
 
-    /// Let a writer that has been failing start succeeding, so a test can watch
-    /// a failed Note be retried.
+    /// Let a writer that has been refusing or unreachable start answering, so a
+    /// test can watch a queue drain.
     fn recover(&self) {
-        self.working.store(true, Ordering::SeqCst);
+        *self.answering.lock().expect("the stub's mode") = Answering::Always;
     }
 }
 
 impl NoteWriter for StubWriter {
     fn write(&self, request: NoteRequest) -> BoxedNote {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-        let working = self.working.load(Ordering::SeqCst);
+        let answering = *self.answering.lock().expect("the stub's mode");
         Box::pin(async move {
-            anyhow::ensure!(working, "this stub was asked to fail");
-            Ok(format!(
-                "reading {attempt} of {:?} from {}: {}",
-                request.spelling, request.book_name, request.sentence
-            ))
+            if answering == Answering::Slowly {
+                for _ in 0..DAWDLE.saturating_sub(attempt) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            match answering {
+                Answering::Refusing => Err(Unwritten::Refused(anyhow::anyhow!(
+                    "this stub was asked to refuse"
+                ))),
+                Answering::Unreachable => Err(Unwritten::Unreachable(anyhow::anyhow!(
+                    "this stub cannot be reached"
+                ))),
+                Answering::Always | Answering::Slowly => Ok(format!(
+                    "reading {attempt} of {:?} from {}: {}",
+                    request.spelling, request.book_name, request.sentence
+                )),
+            }
         })
     }
 }
@@ -96,12 +126,22 @@ pub struct Harness {
 impl Harness {
     /// Notes on, and the writer answers every time.
     pub fn new() -> Self {
-        Self::writing(Some(StubWriter::new(true)))
+        Self::writing(Some(StubWriter::new(Answering::Always)))
     }
 
-    /// Notes on, but every attempt errors — the network is down.
+    /// Notes on, but the writer answers and the answer is no.
     pub fn failing() -> Self {
-        Self::writing(Some(StubWriter::new(false)))
+        Self::writing(Some(StubWriter::new(Answering::Refusing)))
+    }
+
+    /// Notes on, but there is nothing to reach — reading on a train.
+    pub fn offline() -> Self {
+        Self::writing(Some(StubWriter::new(Answering::Unreachable)))
+    }
+
+    /// Notes on, but each answer overtakes the one asked before it.
+    pub fn dawdling() -> Self {
+        Self::writing(Some(StubWriter::new(Answering::Slowly)))
     }
 
     /// No writer at all, as when the API key is missing.

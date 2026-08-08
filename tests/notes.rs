@@ -108,6 +108,38 @@ fn a_note_already_written_is_not_written_again() {
     vocab.assert_shows("reading 1");
 }
 
+// -- Reading with no network ----------------------------------------------
+
+#[test]
+fn a_note_asked_for_offline_stays_queued_rather_than_failing() {
+    let mut vocab = captured(Harness::offline());
+
+    vocab.settle();
+
+    // Asking cost nothing: the question is still worth asking later.
+    vocab
+        .assert_shows("Note pending")
+        .assert_does_not_show("couldn't be written");
+}
+
+#[test]
+fn a_queue_left_by_a_train_journey_drains_once_there_is_a_network() {
+    let mut vocab = captured(Harness::offline());
+    vocab.submit("/add doubloon");
+    vocab.submit("The doubloon was nailed to the mast.");
+    vocab.settle();
+
+    vocab.notes_recover();
+    let mut vocab = vocab.restart();
+    vocab.type_text("cetacean").enter().settle();
+    vocab.assert_shows("from Moby-Dick: A great cetacean surfaced beside the boat.");
+
+    // Back out of the Word, then out of the search it came from.
+    vocab.press(KeyCode::Esc).press(KeyCode::Esc);
+    vocab.type_text("doubloon").enter();
+    vocab.assert_shows("from Moby-Dick: The doubloon was nailed to the mast.");
+}
+
 // -- When the writer fails ------------------------------------------------
 
 #[test]
@@ -151,11 +183,13 @@ fn notes_are_off_without_a_key_and_the_tool_says_so_once() {
     vocab.submit("/add cetacean");
     vocab.submit("A great cetacean surfaced beside the boat.");
 
-    // The capture is ordinary — the missing key is not an error per capture.
+    // The capture is ordinary — the missing key is not an error per capture —
+    // and the Sighting says which kind of waiting it is doing rather than
+    // promising a Note that cannot arrive this run.
     vocab
         .assert_shows("Captured from Moby-Dick")
-        .assert_shows("Note pending")
-        .assert_does_not_show("Notes are off");
+        .assert_shows("Note pending — Notes are off")
+        .assert_does_not_show("set DEEPSEEK_API_KEY");
 }
 
 // -- /explain -------------------------------------------------------------
@@ -181,6 +215,22 @@ fn explain_rewrites_a_note_that_was_already_written() {
         .assert_does_not_show("reading 1");
 
     vocab.settle();
+    vocab
+        .assert_shows("reading 2")
+        .assert_does_not_show("reading 1");
+}
+
+/// Asking again while the first answer is still in the air. The answers come
+/// back in the order they finish, not the order they were asked for, so the one
+/// `/explain` replaced must not be allowed to land on top of the one it asked
+/// for.
+#[test]
+fn a_note_is_not_overwritten_by_the_answer_it_replaced() {
+    let mut vocab = captured(Harness::dawdling());
+
+    vocab.submit("/explain");
+    vocab.settle();
+
     vocab
         .assert_shows("reading 2")
         .assert_does_not_show("reading 1");

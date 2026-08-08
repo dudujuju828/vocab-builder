@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::dictionary::Dictionary;
 use crate::domain::{Book, Definition, Sighting, Word};
-use crate::notes::{NoteOutcome, Notes};
+use crate::notes::{NoteOutcome, Notes, Unwritten};
 use crate::search::{Search, SearchResult};
 use crate::store::{CorpusWord, Store};
 use crate::ui;
@@ -215,6 +215,12 @@ impl App {
 
     pub fn current_book(&self) -> Option<&Book> {
         self.current_book.as_ref()
+    }
+
+    /// Whether Notes are being written at all, so a pending one can say which
+    /// kind of waiting it is doing.
+    pub fn notes_are_on(&self) -> bool {
+        self.notes.are_on()
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -463,9 +469,7 @@ impl App {
 
         // Queued, not waited on: the Sighting is already safe, and the Note
         // arrives on the screen the reader is already looking at.
-        if let Some(request) = self.store.note_request(captured.sighting_id)? {
-            self.notes.enqueue(request);
-        }
+        self.ask_for_note(captured.sighting_id)?;
 
         let Some(word) = self.store.word(captured.word_id)? else {
             self.inform(Tone::Warning, "That Word could not be read back.");
@@ -569,9 +573,7 @@ impl App {
 
         let sighting_id = sighting.id;
         self.store.queue_note(sighting_id)?;
-        if let Some(request) = self.store.note_request(sighting_id)? {
-            self.notes.enqueue(request);
-        }
+        self.ask_for_note(sighting_id)?;
         // Re-read straight away, so the Sighting shows as pending from the
         // moment it was asked about rather than once the answer lands.
         self.reread_sightings()?;
@@ -579,11 +581,19 @@ impl App {
         Ok(())
     }
 
+    /// Put one Sighting in front of the writer.
+    fn ask_for_note(&mut self, sighting_id: i64) -> Result<()> {
+        if let Some(request) = self.store.note_request(sighting_id)? {
+            self.notes.enqueue(request);
+        }
+        Ok(())
+    }
+
     /// Take in every Note that has finished. Never waits, so the event loop can
     /// call it on every pass.
     pub fn collect_notes(&mut self) -> Result<()> {
         let finished = self.notes.collect();
-        self.absorb(finished)
+        self.apply(finished)
     }
 
     /// Wait for every Note in flight, then take them all in.
@@ -592,19 +602,23 @@ impl App {
     /// sleeping or polling.
     pub async fn settle_notes(&mut self) -> Result<()> {
         let finished = self.notes.settle().await;
-        self.absorb(finished)
+        self.apply(finished)
     }
 
-    fn absorb(&mut self, finished: Vec<NoteOutcome>) -> Result<()> {
+    fn apply(&mut self, finished: Vec<NoteOutcome>) -> Result<()> {
         if finished.is_empty() {
             return Ok(());
         }
         for outcome in finished {
             match outcome.note {
                 Ok(note) => self.store.write_note(outcome.sighting_id, &note)?,
-                // The Sighting is left exactly as it was. A failure costs the
-                // reading, never the capture.
-                Err(_) => self.store.fail_note(outcome.sighting_id)?,
+                // Nothing there to ask. The Sighting stays queued, and the next
+                // launch with a network behind it drains the backlog — so a
+                // train's worth of captures costs nothing.
+                Err(Unwritten::Unreachable(_)) => {}
+                // Asked, and refused. The Sighting is left exactly as it was: a
+                // refusal costs the reading, never the capture.
+                Err(Unwritten::Refused(_)) => self.store.fail_note(outcome.sighting_id)?,
             }
         }
         // The Note should feel like it arrived, so a Word already on screen is
