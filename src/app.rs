@@ -5,20 +5,32 @@
 //! with key events, and rendered into a frame — which is what lets tests drive
 //! the whole tool the way a reader does.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::cards::{Card, CardOutcome, Cards, Unpushed};
+use crate::config::Config;
 use crate::dictionary::Dictionary;
 use crate::domain::{Book, Definition, Sighting, Word};
 use crate::notes::{NoteOutcome, Notes, Unwritten};
 use crate::search::{Search, SearchResult};
 use crate::store::{CorpusWord, Store};
-use crate::ui;
+use crate::ui::{self, plural};
 
 /// Said once at launch when there is no writer, and again if `/explain` is
 /// asked for something that cannot happen. Never per capture.
 const NOTES_ARE_OFF: &str = "Notes are off — set DEEPSEEK_API_KEY to have them written.";
+
+/// How long leaving will wait on Anki before going anyway.
+///
+/// Anki is on the same machine, so a sync that is going to work is over in
+/// well under this. What this bounds is the case where it isn't going to work:
+/// a wedged Anki or a connection that hangs. Quitting always wins, and whatever
+/// hasn't answered simply stays queued for next time.
+const PATIENCE_ON_THE_WAY_OUT: Duration = Duration::from_secs(3);
 
 /// The command surface. Listed by `/help`, and the source of the argument hints
 /// shown as a command is typed.
@@ -50,14 +62,19 @@ pub const COMMANDS: &[Command] = &[
         help: "write the Note for the Sighting you are on again",
     },
     Command {
+        name: "/sync",
+        argument: "",
+        help: "push everything that has changed to Anki",
+    },
+    Command {
         name: "/help",
         argument: "",
         help: "list every command",
     },
     Command {
         name: "/quit",
-        argument: "",
-        help: "leave, restoring your terminal",
+        argument: "[now]",
+        help: "leave, syncing on the way out — \"now\" skips the sync",
     },
 ];
 
@@ -146,10 +163,26 @@ pub struct Message {
     pub tone: Tone,
 }
 
+/// What one sync did, accumulated as the answers come back.
+///
+/// Held rather than derived because the pushes answer one at a time and out of
+/// order, and the reader is owed one sentence about the lot of them.
+#[derive(Default, Clone, Copy)]
+struct Syncing {
+    asked: usize,
+    answered: usize,
+    pushed: usize,
+    /// Whether anything came back saying Anki wasn't there, which is much the
+    /// commonest reason a sync doesn't happen and the one worth naming.
+    anki_was_shut: bool,
+}
+
 pub struct App {
     store: Store,
     dictionary: Dictionary,
     notes: Notes,
+    cards: Cards,
+    config: Config,
     search: Search,
     corpus: Vec<CorpusWord>,
     /// Held rather than queried, so rendering never touches the database and a
@@ -159,11 +192,24 @@ pub struct App {
     input: String,
     prompt: Prompt,
     message: Option<Message>,
+    syncing: Syncing,
+    /// The last thing a sync had to say, kept apart from [`App::message`] so
+    /// that what is printed on the way out is about the deck and nothing else.
+    farewell: Option<String>,
     running: bool,
+    /// Whether leaving should push what changed. Starts from the configuration
+    /// and is turned off for this exit by `/quit now`.
+    sync_on_exit: bool,
 }
 
 impl App {
-    pub fn new(store: Store, dictionary: Dictionary, mut notes: Notes) -> Result<Self> {
+    pub fn new(
+        store: Store,
+        dictionary: Dictionary,
+        mut notes: Notes,
+        cards: Cards,
+        config: Config,
+    ) -> Result<Self> {
         let corpus = store.corpus()?;
         let current_book = store.current_book()?;
 
@@ -189,7 +235,12 @@ impl App {
                 tone: Tone::Warning,
             }),
             notes,
+            cards,
+            syncing: Syncing::default(),
+            farewell: None,
             running: true,
+            sync_on_exit: config.sync_on_exit,
+            config,
         })
     }
 
@@ -211,6 +262,17 @@ impl App {
 
     pub fn message(&self) -> Option<&Message> {
         self.message.as_ref()
+    }
+
+    /// What the last sync had to say, if there was one.
+    ///
+    /// The alternate screen is torn down the instant the tool leaves, so a
+    /// farewell drawn into it is a farewell nobody reads. This is what gets
+    /// printed once the terminal is the reader's again — and it is only ever
+    /// about the deck, so quitting doesn't echo whatever happened to be on the
+    /// message line at the time.
+    pub fn farewell(&self) -> Option<&str> {
+        self.farewell.as_deref()
     }
 
     pub fn current_book(&self) -> Option<&Book> {
@@ -238,8 +300,11 @@ impl App {
 
         // Not in the spec's command surface, but a terminal tool that cannot be
         // interrupted is one that can strand a reader with a mangled terminal.
-        // Routing it through the same exit restores the screen either way.
+        // Routing it through the same exit restores the screen either way — and
+        // an interrupt means leave now, so it skips the sync exactly as
+        // `/quit now` does. Nothing is lost by that: the Words stay queued.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.sync_on_exit = false;
             self.running = false;
             return Ok(());
         }
@@ -399,14 +464,12 @@ impl App {
             "/book" => self.switch_book(argument),
             "/library" => self.show_library(),
             "/explain" => self.explain(),
+            "/sync" => self.sync(),
             "/help" => {
                 self.screen = Screen::Help;
                 Ok(())
             }
-            "/quit" => {
-                self.running = false;
-                Ok(())
-            }
+            "/quit" => self.quit(argument),
             _ => {
                 self.inform(Tone::Warning, format!("{name} isn't a command. Try /help."));
                 Ok(())
@@ -638,6 +701,179 @@ impl App {
         Ok(())
     }
 
+    // -- Anki sync --------------------------------------------------------
+
+    fn sync(&mut self) -> Result<()> {
+        if self.cards.busy() {
+            self.inform(Tone::Info, "Already syncing to Anki…");
+            return Ok(());
+        }
+
+        let asked = self.start_sync()?;
+        if asked == 0 {
+            self.inform(Tone::Info, "Nothing to sync — Anki is up to date.");
+        } else {
+            self.inform(
+                Tone::Info,
+                format!("Syncing {asked} {} to Anki…", plural(asked, "Word")),
+            );
+        }
+        Ok(())
+    }
+
+    /// Put every Word whose card is out of date in front of Anki.
+    fn start_sync(&mut self) -> Result<usize> {
+        let requests = self.store.changed_cards()?;
+        self.syncing = Syncing {
+            asked: requests.len(),
+            ..Syncing::default()
+        };
+
+        for request in &requests {
+            let definitions = self.dictionary.look_up(&request.spelling)?;
+            let sightings = self.store.sightings(request.word_id)?;
+            self.cards.push(Card::assemble(
+                request,
+                &self.config.deck,
+                &definitions,
+                &sightings,
+            ));
+        }
+        Ok(requests.len())
+    }
+
+    /// Take in every push that has finished. Never waits, so the event loop can
+    /// call it on every pass.
+    pub fn collect_synced(&mut self) -> Result<()> {
+        let finished = self.cards.collect();
+        self.took(finished)
+    }
+
+    /// Wait for the sync in flight, then take in what came back.
+    ///
+    /// Bounded, which is why this is also what leaving calls: whatever Anki has
+    /// not answered by the deadline is left queued rather than waited on.
+    pub async fn settle_sync(&mut self) -> Result<()> {
+        let finished = self.cards.settle(PATIENCE_ON_THE_WAY_OUT).await;
+        self.took(finished)?;
+        // Said even when nothing came back at all, because a sync that pushed
+        // nothing is exactly the one the reader needs telling about.
+        self.report_sync();
+        Ok(())
+    }
+
+    fn took(&mut self, finished: Vec<CardOutcome>) -> Result<()> {
+        if finished.is_empty() {
+            return Ok(());
+        }
+
+        for outcome in finished {
+            self.syncing.answered += 1;
+            match outcome.pushed {
+                Ok(anki_note_id) => {
+                    self.store
+                        .mark_synced(outcome.word_id, anki_note_id, outcome.revision)?;
+                    self.syncing.pushed += 1;
+                }
+                // Neither one is recorded against the Word: it stays queued and
+                // the next sync tries again. Only the wording differs.
+                Err(Unpushed::Unavailable(_)) => self.syncing.anki_was_shut = true,
+                Err(Unpushed::Refused(_)) => {}
+            }
+        }
+
+        if self.syncing.answered >= self.syncing.asked {
+            self.report_sync();
+        }
+        Ok(())
+    }
+
+    /// One sentence about what a sync did, so the reader can trust the state of
+    /// their deck rather than guess at it.
+    fn report_sync(&mut self) {
+        let Syncing {
+            asked,
+            pushed,
+            anki_was_shut,
+            ..
+        } = self.syncing;
+        if asked == 0 {
+            return;
+        }
+
+        // Everything not pushed is queued, whether Anki refused it or never
+        // answered at all — there is nowhere else for it to have gone.
+        let queued = asked.saturating_sub(pushed);
+        let words = plural(queued, "Word");
+        let (tone, text) = match (pushed, queued) {
+            (_, 0) => (
+                Tone::Info,
+                format!("Synced {pushed} {} to Anki.", plural(pushed, "Word")),
+            ),
+            (0, _) if anki_was_shut => (
+                Tone::Warning,
+                format!(
+                    "Anki isn't running — {queued} {words} {} queued.",
+                    stays(queued)
+                ),
+            ),
+            (0, _) => (
+                Tone::Warning,
+                format!(
+                    "Nothing went to Anki — {queued} {words} {} queued.",
+                    stays(queued)
+                ),
+            ),
+            _ => (
+                Tone::Warning,
+                format!(
+                    "Synced {pushed} of {asked} Words — {queued} {} queued.",
+                    stays(queued)
+                ),
+            ),
+        };
+        self.farewell = Some(text.clone());
+        self.inform(tone, text);
+    }
+
+    // -- Leaving ----------------------------------------------------------
+
+    fn quit(&mut self, argument: &str) -> Result<()> {
+        match argument.trim() {
+            "" => {}
+            "now" => self.sync_on_exit = false,
+            other => {
+                self.inform(
+                    Tone::Warning,
+                    format!(
+                        "/quit takes nothing, or \"now\" to leave without syncing — not {other:?}."
+                    ),
+                );
+                return Ok(());
+            }
+        }
+        self.running = false;
+        Ok(())
+    }
+
+    /// Begin the sync that leaving triggers.
+    ///
+    /// Separated from the waiting so the caller can put the screen in front of
+    /// the reader while it happens rather than freezing on the last frame drawn.
+    /// Finish it with [`App::settle_sync`], which is what bounds the wait.
+    pub fn start_leaving(&mut self) -> Result<()> {
+        if !self.sync_on_exit {
+            return Ok(());
+        }
+        // A sync already under way is left to finish rather than doubled: two
+        // pushes of one Word would each be a card Anki has never seen, and the
+        // reader would get two. Anything captured since goes next time.
+        if !self.cards.busy() {
+            self.start_sync()?;
+        }
+        Ok(())
+    }
+
     // -- Screens ----------------------------------------------------------
 
     fn open_selected(&mut self) -> Result<()> {
@@ -693,6 +929,12 @@ impl App {
             tone,
         });
     }
+}
+
+/// "stays" or "stay", so the sentence about what didn't go reads properly
+/// whether it was one Word or several.
+fn stays(count: usize) -> &'static str {
+    if count == 1 { "stays" } else { "stay" }
 }
 
 /// The completion and argument hint for a partly typed command, shown dimmed

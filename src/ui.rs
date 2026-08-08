@@ -351,7 +351,7 @@ fn draw_input(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn plural(count: usize, noun: &str) -> String {
+pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         noun.to_string()
     } else {

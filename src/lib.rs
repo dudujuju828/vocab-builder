@@ -4,7 +4,10 @@
 //! one seam: construct [`App`] with its dependencies injected, send it key
 //! events, and assert against what was rendered.
 
+pub mod anki;
 pub mod app;
+pub mod cards;
+pub mod config;
 pub mod deepseek;
 pub mod dictionary;
 pub mod domain;
@@ -13,7 +16,10 @@ pub mod search;
 pub mod store;
 pub mod ui;
 
+pub use anki::Anki;
 pub use app::App;
+pub use cards::Cards;
+pub use config::Config;
 pub use deepseek::DeepSeek;
 pub use dictionary::Dictionary;
 pub use notes::Notes;

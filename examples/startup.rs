@@ -24,7 +24,12 @@ fn main() -> anyhow::Result<()> {
         let store = vocab::Store::open(&directory.join("vocab.db"))?;
         let dictionary = vocab::Dictionary::unpack_into(&directory)?;
         let notes = vocab::Notes::new(None, runtime.handle().clone());
-        let _app = vocab::App::new(store, dictionary, notes)?;
+        let cards = {
+            let _inside = runtime.enter();
+            vocab::Cards::new(vocab::Anki::on_this_machine()?, runtime.handle().clone())
+        };
+        let config = vocab::Config::load_or_create(&directory.join("config.toml"))?;
+        let _app = vocab::App::new(store, dictionary, notes, cards, config)?;
 
         println!("{label}: {:?}", start.elapsed());
     }

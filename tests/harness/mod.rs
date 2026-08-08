@@ -6,15 +6,19 @@
 //! would see; none of them call into the application's internals or inspect
 //! database rows.
 //!
-//! Of the four injected dependencies, only one is faked: the user database is a
+//! Of the injected dependencies, only two are faked: the user database is a
 //! real SQLite file in a temporary directory, fresh per test, and the dictionary
-//! is the real bundled WordNet, which is read-only and deterministic. Only the
-//! `NoteWriter` is a stub, because the alternative is the network.
+//! is the real bundled WordNet, which is read-only and deterministic. The
+//! `NoteWriter` and the `CardSync` are stubs, because the alternative to each is
+//! the network.
+//!
+//! The card payload is the one thing here that a reader never sees on screen, so
+//! it is read back off the `CardSync` stub rather than off the buffer.
 
 #![allow(dead_code)] // Each integration test file uses a different subset.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ratatui::Terminal;
@@ -22,8 +26,10 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use vocab::cards::{BoxedPush, Card, CardSync, Cards, Unpushed};
+use vocab::config::DEFAULT_DECK;
 use vocab::notes::{BoxedNote, NoteRequest, NoteWriter, Notes, Unwritten};
-use vocab::{App, Dictionary, Store};
+use vocab::{App, Config, Dictionary, Store};
 
 const WIDTH: u16 = 100;
 const HEIGHT: u16 = 40;
@@ -42,7 +48,7 @@ fn dictionary() -> Dictionary {
     Dictionary::open(&directory.join("wordnet.db")).expect("opening the bundled dictionary")
 }
 
-/// How the stub behaves when it is asked.
+/// How the stub writer behaves when it is asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answering {
     /// Answers, every time.
@@ -57,11 +63,24 @@ enum Answering {
     Unreachable,
 }
 
+/// How the fake Anki behaves when it is handed a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anki {
+    /// Running, and takes what it is given.
+    Open,
+    /// Not running — the ordinary state of the machine, and not an error.
+    Shut,
+    /// Running, and says no.
+    Refusing,
+    /// Takes the question and never answers it, as a wedged Anki would.
+    Hanging,
+}
+
 /// How many turns the slowest answer dawdles for. Anything above the number of
 /// Notes a test asks for keeps the ordering strictly reversed.
 const DAWDLE: usize = 8;
 
-/// The one fake: a `NoteWriter` that never leaves the process.
+/// The first fake: a `NoteWriter` that never leaves the process.
 ///
 /// The Note it returns echoes back the Word, the Book, and the sentence it was
 /// handed, so a test can tell from the screen alone that all three reached the
@@ -113,57 +132,209 @@ impl NoteWriter for StubWriter {
     }
 }
 
+/// The second fake: a `CardSync` that never leaves the process.
+///
+/// It keeps every card it accepted, so a test can read what the tool tried to
+/// write — the Definition, the sentences, the Books, the dates and the Notes —
+/// which is the one part of the tool that has no expression on screen.
+pub struct StubAnki {
+    behaving: Mutex<Anki>,
+    written: Mutex<Vec<Card>>,
+    /// Stands in for the identifiers Anki hands back. Arbitrary, except that
+    /// each is different from the last.
+    next_note_id: AtomicI64,
+}
+
+impl StubAnki {
+    fn new(behaving: Anki) -> Self {
+        Self {
+            behaving: Mutex::new(behaving),
+            written: Mutex::new(Vec::new()),
+            next_note_id: AtomicI64::new(1_700_000_000_000),
+        }
+    }
+
+    /// Let a closed or refusing Anki start taking cards, so a test can watch a
+    /// queue drain into it.
+    fn opens(&self) {
+        *self.behaving.lock().expect("the fake's mode") = Anki::Open;
+    }
+
+    fn cards(&self) -> Vec<Card> {
+        self.written.lock().expect("the fake's record").clone()
+    }
+}
+
+impl CardSync for StubAnki {
+    fn push(&self, card: Card) -> BoxedPush {
+        let behaving = *self.behaving.lock().expect("the fake's mode");
+
+        let pushed = match behaving {
+            // Never answers. Nothing is recorded, because nothing arrived.
+            Anki::Hanging => return Box::pin(std::future::pending()),
+            Anki::Shut => Err(Unpushed::Unavailable(anyhow::anyhow!(
+                "this fake Anki isn't running"
+            ))),
+            Anki::Refusing => Err(Unpushed::Refused(anyhow::anyhow!(
+                "this fake Anki was asked to refuse"
+            ))),
+            Anki::Open => {
+                // A card that already names a note updates it and keeps its
+                // identifier; one that doesn't is a note being created.
+                let note_id = card
+                    .anki_note_id
+                    .unwrap_or_else(|| self.next_note_id.fetch_add(1, Ordering::SeqCst));
+                self.written.lock().expect("the fake's record").push(card);
+                Ok(note_id)
+            }
+        };
+        Box::pin(async move { pushed })
+    }
+}
+
+/// How one test's tool is put together.
+#[derive(Debug, Clone, Copy)]
+struct Setup {
+    /// Absent when there is no API key and Notes are off for the run.
+    answering: Option<Answering>,
+    anki: Anki,
+    deck: &'static str,
+    sync_on_exit: bool,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            answering: Some(Answering::Always),
+            anki: Anki::Open,
+            deck: DEFAULT_DECK,
+            sync_on_exit: true,
+        }
+    }
+}
+
 pub struct Harness {
     app: App,
     terminal: Terminal<TestBackend>,
     directory: TempDir,
-    /// Single-threaded and driven only by [`Harness::settle`], so a Note is
-    /// written exactly when a test says so and never before.
+    /// Single-threaded and driven only by [`Harness::settle`] and
+    /// [`Harness::leave`], so background work happens exactly when a test says
+    /// so and never before. Its clock is paused: a deadline that would hold up
+    /// quitting fires as soon as nothing else can run, so proving one exists
+    /// costs no test any waiting.
     runtime: Runtime,
+    setup: Setup,
     writer: Option<Arc<StubWriter>>,
+    anki: Arc<StubAnki>,
 }
 
 impl Harness {
-    /// Notes on, and the writer answers every time.
+    /// Notes answer every time, and Anki is running.
     pub fn new() -> Self {
-        Self::writing(Some(StubWriter::new(Answering::Always)))
+        Self::set_up(Setup::default())
     }
 
     /// Notes on, but the writer answers and the answer is no.
     pub fn failing() -> Self {
-        Self::writing(Some(StubWriter::new(Answering::Refusing)))
+        Self::writing(Answering::Refusing)
     }
 
     /// Notes on, but there is nothing to reach — reading on a train.
     pub fn offline() -> Self {
-        Self::writing(Some(StubWriter::new(Answering::Unreachable)))
+        Self::writing(Answering::Unreachable)
     }
 
     /// Notes on, but each answer overtakes the one asked before it.
     pub fn dawdling() -> Self {
-        Self::writing(Some(StubWriter::new(Answering::Slowly)))
+        Self::writing(Answering::Slowly)
     }
 
     /// No writer at all, as when the API key is missing.
     pub fn without_notes() -> Self {
-        Self::writing(None)
+        Self::set_up(Setup {
+            answering: None,
+            ..Setup::default()
+        })
     }
 
-    fn writing(writer: Option<StubWriter>) -> Self {
+    /// Anki isn't running, which is how the machine usually is.
+    pub fn anki_closed() -> Self {
+        Self::against(Anki::Shut)
+    }
+
+    /// Anki is running and won't take the card.
+    pub fn anki_refusing() -> Self {
+        Self::against(Anki::Refusing)
+    }
+
+    /// Anki takes the card and never answers.
+    pub fn anki_hanging() -> Self {
+        Self::against(Anki::Hanging)
+    }
+
+    /// Cards land somewhere other than the default deck.
+    pub fn with_deck(deck: &'static str) -> Self {
+        Self::set_up(Setup {
+            deck,
+            ..Setup::default()
+        })
+    }
+
+    /// Leaving doesn't push anything.
+    pub fn without_sync_on_exit() -> Self {
+        Self::set_up(Setup {
+            sync_on_exit: false,
+            ..Setup::default()
+        })
+    }
+
+    fn writing(answering: Answering) -> Self {
+        Self::set_up(Setup {
+            answering: Some(answering),
+            ..Setup::default()
+        })
+    }
+
+    fn against(anki: Anki) -> Self {
+        Self::set_up(Setup {
+            anki,
+            ..Setup::default()
+        })
+    }
+
+    fn set_up(setup: Setup) -> Self {
         let directory = tempfile::tempdir().expect("creating a temporary directory");
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
             .build()
             .expect("building the runtime");
-        Self::open_in(directory, runtime, writer.map(Arc::new))
+        let writer = setup
+            .answering
+            .map(|answering| Arc::new(StubWriter::new(answering)));
+        let anki = Arc::new(StubAnki::new(setup.anki));
+        Self::open_in(directory, runtime, setup, writer, anki)
     }
 
-    fn open_in(directory: TempDir, runtime: Runtime, writer: Option<Arc<StubWriter>>) -> Self {
+    fn open_in(
+        directory: TempDir,
+        runtime: Runtime,
+        setup: Setup,
+        writer: Option<Arc<StubWriter>>,
+        anki: Arc<StubAnki>,
+    ) -> Self {
         let store = Store::open(&directory.path().join("vocab.db")).expect("opening the store");
         let notes = Notes::new(
             writer.clone().map(|writer| writer as Arc<dyn NoteWriter>),
             runtime.handle().clone(),
         );
-        let app = App::new(store, dictionary(), notes).expect("constructing the app");
+        let cards = Cards::new(anki.clone() as Arc<dyn CardSync>, runtime.handle().clone());
+        let config = Config {
+            deck: setup.deck.to_string(),
+            sync_on_exit: setup.sync_on_exit,
+        };
+        let app =
+            App::new(store, dictionary(), notes, cards, config).expect("constructing the app");
         let terminal =
             Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("constructing the terminal");
         Self {
@@ -171,35 +342,55 @@ impl Harness {
             terminal,
             directory,
             runtime,
+            setup,
             writer,
+            anki,
         }
     }
 
     /// Close the tool and open it again against the same database, as a reader
-    /// would between reading sessions. The writer carries over, so a test can
-    /// tell whether it was asked for the same Note twice.
+    /// would between reading sessions. Both fakes carry over, so a test can tell
+    /// whether the tool asked for the same thing twice.
     pub fn restart(self) -> Self {
         let Self {
             directory,
             runtime,
+            setup,
             writer,
+            anki,
             ..
         } = self;
-        Self::open_in(directory, runtime, writer)
+        Self::open_in(directory, runtime, setup, writer, anki)
     }
 
     // -- Driving ----------------------------------------------------------
 
-    /// Drive every Note in flight to completion and apply what came back.
+    /// Drive every Note and every card in flight to completion and apply what
+    /// came back.
     ///
     /// This is what keeps the asynchronous half of the tool testable through
     /// the same screen seam as everything else: no sleeping, no polling, and no
-    /// second seam onto the Note pipeline.
+    /// second seam onto the background work. Notes settle first, because a Note
+    /// arriving is itself a change to the card it belongs on.
     pub fn settle(&mut self) -> &mut Self {
         let Self { app, runtime, .. } = self;
         runtime
             .block_on(app.settle_notes())
             .expect("settling the Notes in flight");
+        runtime
+            .block_on(app.settle_sync())
+            .expect("settling the cards in flight");
+        self
+    }
+
+    /// Leave, which pushes what changed on the way out.
+    pub fn leave(&mut self) -> &mut Self {
+        let Self { app, runtime, .. } = self;
+        app.start_leaving()
+            .expect("starting the sync on the way out");
+        runtime
+            .block_on(app.settle_sync())
+            .expect("waiting on the sync on the way out");
         self
     }
 
@@ -209,6 +400,12 @@ impl Harness {
             .as_ref()
             .expect("a stub writer to recover")
             .recover();
+        self
+    }
+
+    /// Let a closed or refusing Anki start taking cards.
+    pub fn anki_opens(&mut self) -> &mut Self {
+        self.anki.opens();
         self
     }
 
@@ -240,9 +437,12 @@ impl Harness {
             ..event
         };
         self.app.handle_key(event).expect("handling a key event");
-        // The real loop looks for finished Notes on every pass; nothing is
-        // waited on, so an unsettled Note stays pending.
+        // The real loop looks for finished background work on every pass;
+        // nothing is waited on, so anything unsettled stays queued.
         self.app.collect_notes().expect("collecting finished Notes");
+        self.app
+            .collect_synced()
+            .expect("collecting finished pushes");
         self
     }
 
@@ -251,6 +451,20 @@ impl Harness {
     }
 
     // -- Asserting --------------------------------------------------------
+
+    /// Every card the fake Anki accepted, in the order it was handed them.
+    pub fn cards(&self) -> Vec<Card> {
+        self.anki.cards()
+    }
+
+    /// How many of those pushes made a new Anki note rather than updating one
+    /// the tool had already been given an identifier for.
+    pub fn anki_notes_created(&self) -> usize {
+        self.cards()
+            .iter()
+            .filter(|card| card.anki_note_id.is_none())
+            .count()
+    }
 
     /// Everything currently rendered, one line per terminal row.
     pub fn screen(&mut self) -> String {

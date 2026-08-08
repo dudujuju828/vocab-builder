@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::cards::CardRequest;
 use crate::domain::{Book, NoteState, Sighting, Word};
 use crate::notes::NoteRequest;
 
@@ -79,13 +80,23 @@ impl Store {
                  current_book_id INTEGER REFERENCES books(id)
              );
 
-             -- Written by the Anki sync in v3. A Word with no row here has never
-             -- been pushed, which is how v3 finds the backlog v1 left it.
+             -- What Anki holds for each Word. `changed` counts edits since the
+             -- last successful push rather than flagging them, so a Sighting
+             -- captured while a push is in the air is not taken off the queue by
+             -- the answer to a question asked before it existed. Zero means the
+             -- card is up to date.
              CREATE TABLE IF NOT EXISTS sync_state (
                  word_id      INTEGER PRIMARY KEY REFERENCES words(id),
                  anki_note_id INTEGER,
                  changed      INTEGER NOT NULL DEFAULT 1
-             );",
+             );
+
+             -- Every Word has a row, so the revision above is always a real
+             -- number rather than an assumed one. This is also how the backlog
+             -- left by v1 and v2 — captured long before there was a sync —
+             -- arrives already queued.
+             INSERT OR IGNORE INTO sync_state (word_id, changed)
+                  SELECT id, 1 FROM words;",
         )?;
         Ok(())
     }
@@ -210,6 +221,9 @@ impl Store {
             params![word_id, book_id, sentence.trim(), now_string()],
         )?;
 
+        // The card's back carries every Sighting, so this one has changed it.
+        self.mark_card_changed(word_id)?;
+
         Ok(Captured {
             word_id,
             sighting_id: self.connection.last_insert_rowid(),
@@ -280,6 +294,14 @@ impl Store {
             "UPDATE sightings SET note = ?2, note_state = 'ready' WHERE id = ?1",
             params![sighting_id, note.trim()],
         )?;
+        // The Note goes on the card, so the card is now out of date. A Note
+        // arriving after a sync is the ordinary case, not an unusual one: it is
+        // written in the background, well after the Sighting it belongs to.
+        self.connection.execute(
+            "UPDATE sync_state SET changed = changed + 1
+              WHERE word_id = (SELECT word_id FROM sightings WHERE id = ?1)",
+            [sighting_id],
+        )?;
         Ok(())
     }
 
@@ -301,6 +323,65 @@ impl Store {
         self.connection.execute(
             "UPDATE sightings SET note = NULL, note_state = 'pending' WHERE id = ?1",
             [sighting_id],
+        )?;
+        Ok(())
+    }
+
+    // -- Anki sync --------------------------------------------------------
+
+    /// Every Word whose card is out of date, oldest first.
+    ///
+    /// This is the sync queue. A Word is on it from the moment it is captured
+    /// until a push for the revision it was read at comes back, so nothing is
+    /// ever taken off the queue on the strength of an attempt that failed.
+    pub fn changed_cards(&self) -> Result<Vec<CardRequest>> {
+        let mut statement = self.connection.prepare(
+            "SELECT words.id, words.spelling, sync_state.anki_note_id, sync_state.changed
+               FROM words
+               JOIN sync_state ON sync_state.word_id = words.id
+              WHERE sync_state.changed != 0
+              ORDER BY words.id",
+        )?;
+        let requests = statement
+            .query_map([], |row| {
+                Ok(CardRequest {
+                    word_id: row.get(0)?,
+                    spelling: row.get(1)?,
+                    anki_note_id: row.get(2)?,
+                    revision: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(requests)
+    }
+
+    /// Note that a Word's card no longer says what the Word says.
+    ///
+    /// The upsert is for the Word that has only just been inserted, which has
+    /// no row of its own yet.
+    pub fn mark_card_changed(&self, word_id: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO sync_state (word_id, changed) VALUES (?1, 1)
+             ON CONFLICT(word_id) DO UPDATE SET changed = sync_state.changed + 1",
+            [word_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record which Anki note a Word now has.
+    ///
+    /// The identifier is kept whatever else happened — it is true from now on,
+    /// and it is what stops the next push creating a second card. The Word only
+    /// comes off the queue if nothing has changed it since `revision` was read;
+    /// a Sighting captured while the push was in the air leaves it queued, and
+    /// the next sync carries what arrived in the meantime.
+    pub fn mark_synced(&self, word_id: i64, anki_note_id: i64, revision: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sync_state
+                SET anki_note_id = ?2,
+                    changed = CASE WHEN changed = ?3 THEN 0 ELSE changed END
+              WHERE word_id = ?1",
+            params![word_id, anki_note_id, revision],
         )?;
         Ok(())
     }
