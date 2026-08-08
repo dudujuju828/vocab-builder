@@ -27,6 +27,17 @@ const MODEL: &str = "deepseek-v4-pro";
 /// A Note is one or two sentences; this is the ceiling, not the target.
 const MOST_TOKENS: u32 = 200;
 
+/// Both DeepSeek V4 models reason before they answer, and the reasoning is
+/// spent out of the same budget as the reply.
+///
+/// A one-sentence reading of a word in a sentence does not need a reasoning
+/// trace, and with one it never arrives: the trace alone runs past
+/// [`MOST_TOKENS`], the reply comes back empty with `finish_reason` of
+/// `length`, and every Note fails. Turning it off is also what keeps a Note the
+/// single cheap round trip ADR 0004 costed — with it on, the reading above cost
+/// 292 reasoning tokens to produce 13 of answer.
+const REASONING: &str = "none";
+
 /// Long enough that a slow answer still arrives, short enough that a hung
 /// connection doesn't hold a Note open for the rest of the session.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -86,6 +97,7 @@ async fn ask(client: Client, key: String, request: NoteRequest) -> Written {
             model: MODEL,
             messages: prompt(&request),
             max_tokens: MOST_TOKENS,
+            reasoning_effort: REASONING,
             stream: false,
         })
         .send()
@@ -117,13 +129,31 @@ async fn ask(client: Client, key: String, request: NoteRequest) -> Written {
             Error::new(error).context(format!("reading DeepSeek's answer about {spelling:?}")),
         )
     })?;
-    let note = answer
-        .choices
-        .into_iter()
-        .next()
-        .map(|choice| choice.message.content)
-        .unwrap_or_default();
-    let note = note.trim().to_string();
+    read(answer, &spelling)
+}
+
+/// Take the Note out of an answer DeepSeek has already given.
+///
+/// Separated from the sending so that the shapes an answer can arrive in are
+/// testable without a network — which is how the truncation below was found
+/// only after it had made every Note fail.
+fn read(answer: Answer, spelling: &str) -> Written {
+    let Some(choice) = answer.choices.into_iter().next() else {
+        return Err(Unwritten::Refused(anyhow!(
+            "DeepSeek answered about {spelling:?} without a reply in it"
+        )));
+    };
+    let note = choice.message.content.trim().to_string();
+
+    // The ceiling was reached before the reading was finished. Half a sentence
+    // stored as a Note would read as though it were the whole answer, and an
+    // empty one would look like a refusal — neither says what went wrong.
+    if choice.finish_reason.as_deref() == Some("length") {
+        return Err(Unwritten::Refused(anyhow!(
+            "DeepSeek ran out of room before finishing its reading of {spelling:?}: \
+             {MOST_TOKENS} tokens was not enough"
+        )));
+    }
 
     // An empty Note would render as though one had been written. Refusing is
     // visible and retryable; a blank line is neither.
@@ -162,6 +192,7 @@ struct Ask<'a> {
     model: &'a str,
     messages: [Message; 2],
     max_tokens: u32,
+    reasoning_effort: &'a str,
     stream: bool,
 }
 
@@ -179,6 +210,9 @@ struct Answer {
 #[derive(Deserialize)]
 struct Choice {
     message: Reply,
+    /// Absent on some OpenAI-compatible answers, so it is read as an option
+    /// rather than required — a missing reason is not a truncated reading.
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +223,62 @@ struct Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn answer(content: &str, finish_reason: &str) -> Answer {
+        Answer {
+            choices: vec![Choice {
+                message: Reply {
+                    content: content.to_string(),
+                },
+                finish_reason: Some(finish_reason.to_string()),
+            }],
+        }
+    }
+
+    /// The failure that made every Note fail: the budget went on a reasoning
+    /// trace, and what little reply fitted was half a sentence. Stored as a Note
+    /// it would read as the whole answer, so it has to be refused.
+    #[test]
+    fn a_reading_that_ran_out_of_room_is_not_a_note() {
+        let cut_off = answer("In this sentence, \"cetacean\" serves as a", "length");
+
+        let Err(Unwritten::Refused(why)) = read(cut_off, "cetacean") else {
+            panic!("a truncated reading was taken for a Note");
+        };
+        assert!(why.to_string().contains("cetacean"), "which Word: {why}");
+    }
+
+    #[test]
+    fn a_finished_reading_is_the_note() {
+        let Ok(note) = read(
+            answer("  It labels the whale coldly.  ", "stop"),
+            "cetacean",
+        ) else {
+            panic!("a finished reading was refused");
+        };
+
+        assert_eq!(note, "It labels the whale coldly.");
+    }
+
+    /// Nothing to say is refused rather than stored: a blank Note renders as
+    /// though one had been written, and cannot be told from a real one.
+    #[test]
+    fn an_empty_reading_is_not_a_note() {
+        assert!(matches!(
+            read(answer("   ", "stop"), "cetacean"),
+            Err(Unwritten::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn an_answer_with_no_reply_in_it_is_not_a_note() {
+        let empty = Answer { choices: vec![] };
+
+        assert!(matches!(
+            read(empty, "cetacean"),
+            Err(Unwritten::Refused(_))
+        ));
+    }
 
     fn request(spelling: &str, book: &str, sentence: &str) -> NoteRequest {
         NoteRequest {
