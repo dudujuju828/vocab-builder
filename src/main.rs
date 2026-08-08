@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event};
 use tokio::runtime::Builder;
-use vocab::{App, Dictionary, Notes, Store};
+use vocab::{App, DeepSeek, Dictionary, Notes, Store};
 
 fn main() -> Result<()> {
     let data_directory = data_directory()?;
@@ -21,7 +21,13 @@ fn main() -> Result<()> {
         .enable_all()
         .thread_name("vocab-notes")
         .build()?;
-    let notes = Notes::new(None, runtime.handle().clone());
+    // The HTTP client wants a runtime to register itself with, and the key
+    // comes from the environment — its absence turns Notes off for the run
+    // rather than erroring on every capture.
+    let notes = {
+        let _inside = runtime.enter();
+        Notes::new(DeepSeek::from_environment(), runtime.handle().clone())
+    };
     let mut app = App::new(store, dictionary, notes)?;
 
     // Restores the terminal to what was on it before, however the loop ends —
