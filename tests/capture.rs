@@ -57,7 +57,7 @@ fn a_word_the_dictionary_does_not_have_is_still_captured() {
 
     vocab
         .assert_shows("pequod")
-        .assert_shows("No definition")
+        .assert_shows("No Definition")
         .assert_shows("The Pequod sailed at dawn.")
         .assert_shows("1 Sighting");
 }
@@ -98,7 +98,7 @@ fn meeting_a_word_again_says_so_and_shows_where_it_was_met_before() {
     vocab
         .assert_shows("You already have")
         .assert_shows("A great cetacean surfaced beside the boat.")
-        .assert_shows("add another context");
+        .assert_shows("add another Sighting");
 }
 
 #[test]

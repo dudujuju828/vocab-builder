@@ -129,6 +129,13 @@ impl Harness {
             .join("\n")
     }
 
+    /// Just the input line — the bottom row, where what you type and the
+    /// argument hint after it are drawn.
+    pub fn input_line(&mut self) -> String {
+        let screen = self.screen();
+        screen.lines().last().unwrap_or_default().trim().to_string()
+    }
+
     pub fn assert_shows(&mut self, expected: &str) -> &mut Self {
         let screen = self.screen();
         assert!(

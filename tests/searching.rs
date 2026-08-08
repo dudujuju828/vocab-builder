@@ -1,4 +1,4 @@
-//! Live search across Words, sentences and Book titles.
+//! Live search across Words, sentences and Book names.
 
 mod harness;
 
@@ -60,7 +60,7 @@ fn searching_matches_the_sentences_too() {
 }
 
 #[test]
-fn searching_matches_book_titles() {
+fn searching_matches_book_names() {
     let mut vocab = stocked();
 
     vocab.type_text("Moby");
@@ -84,6 +84,39 @@ fn word_matches_are_ranked_above_sentence_matches() {
     vocab.type_text("cetacean");
 
     vocab.assert_shows_in_order("cetacean", "doubloon");
+}
+
+#[test]
+fn sentence_matches_are_ranked_above_book_matches() {
+    let mut vocab = Harness::new();
+    // The Book name is the query, so every Word in it matches on the Book band.
+    vocab.submit("/book Cetacean Weekly").press(KeyCode::Char('y'));
+    vocab.submit("/add doubloon");
+    vocab.submit("He nailed it to the mast.");
+    vocab.submit("/add sonorous");
+    vocab.submit("A cetacean broke the surface.");
+
+    vocab.type_text("cetacean");
+
+    // sonorous matched a sentence; doubloon only matched the Book it came from.
+    vocab.assert_shows_in_order("sonorous", "doubloon");
+}
+
+#[test]
+fn each_result_says_which_kind_of_match_it_is() {
+    let mut vocab = Harness::new();
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+    vocab.submit("/add cetacean");
+    vocab.submit("It surfaced beside the boat.");
+    vocab.submit("/add doubloon");
+    vocab.submit("The cetacean had taken it.");
+
+    vocab.type_text("cetacean");
+
+    // A sentence hit must not be mistakable for a Word hit.
+    vocab
+        .assert_shows("cetacean word")
+        .assert_shows("doubloon sentence The cetacean had taken it.");
 }
 
 #[test]

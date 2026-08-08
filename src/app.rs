@@ -10,9 +10,9 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::dictionary::Dictionary;
-use crate::domain::{Book, Sense, Sighting, Word};
+use crate::domain::{Book, Definition, Sighting, Word};
 use crate::search::{Search, SearchResult};
-use crate::store::{CorpusEntry, Store};
+use crate::store::{CorpusWord, Store};
 use crate::ui;
 
 /// The command surface. Listed by `/help`, and the source of the argument hints
@@ -61,13 +61,17 @@ pub enum Screen {
     Word(WordView),
     Library {
         books: Vec<Book>,
+        selected: usize,
     },
+    /// Deviates from the spec, which names four Screens. `/help` has to render
+    /// somewhere, and the alternatives — a message line too short to hold it,
+    /// or an overlay, which ADR 0003 rules out — are worse.
     Help,
 }
 
 pub struct WordView {
     pub word: Word,
-    pub senses: Vec<Sense>,
+    pub definitions: Vec<Definition>,
     pub sightings: Vec<Sighting>,
     /// Where this screen was opened from, so leaving it returns there.
     pub origin: Origin,
@@ -77,16 +81,15 @@ pub struct WordView {
 pub enum Origin {
     Home,
     Search { query: String },
-    Library,
 }
 
 /// What the input line is collecting. Capture is a prompt sequence rather than
 /// a Screen of its own.
 pub enum Prompt {
     None,
-    /// The word is known; collecting the sentence it was met in.
+    /// The Word is known; collecting the sentence it was met in.
     Sentence { spelling: String },
-    /// This Word is already held — add another context for it?
+    /// This Word is already held — add another Sighting for it?
     AnotherSighting { spelling: String },
     /// This Book is not in the Library yet — add it?
     AddBook { name: String },
@@ -99,9 +102,11 @@ impl Prompt {
             Self::None => None,
             Self::Sentence { .. } => Some("sentence:".to_string()),
             Self::AnotherSighting { spelling } => {
-                Some(format!("add another context for \"{spelling}\"? [y/n]"))
+                Some(format!("add another Sighting for \"{spelling}\"? [y/n]"))
             }
-            Self::AddBook { name } => Some(format!("\"{name}\" is not in your Library — add it? [y/n]")),
+            Self::AddBook { name } => {
+                Some(format!("\"{name}\" is not in your Library — add it? [y/n]"))
+            }
         }
     }
 
@@ -126,7 +131,10 @@ pub struct App {
     store: Store,
     dictionary: Dictionary,
     search: Search,
-    corpus: Vec<CorpusEntry>,
+    corpus: Vec<CorpusWord>,
+    /// Held rather than queried, so rendering never touches the database and a
+    /// read failure cannot silently render as "no Book yet".
+    current_book: Option<Book>,
     screen: Screen,
     input: String,
     prompt: Prompt,
@@ -137,11 +145,13 @@ pub struct App {
 impl App {
     pub fn new(store: Store, dictionary: Dictionary) -> Result<Self> {
         let corpus = store.corpus()?;
+        let current_book = store.current_book()?;
         Ok(Self {
             store,
             dictionary,
             search: Search::new(),
             corpus,
+            current_book,
             screen: Screen::Home,
             input: String::new(),
             prompt: Prompt::None,
@@ -170,8 +180,8 @@ impl App {
         self.message.as_ref()
     }
 
-    pub fn current_book(&self) -> Option<Book> {
-        self.store.current_book().ok().flatten()
+    pub fn current_book(&self) -> Option<&Book> {
+        self.current_book.as_ref()
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -187,6 +197,9 @@ impl App {
             return Ok(());
         }
 
+        // Not in the spec's command surface, but a terminal tool that cannot be
+        // interrupted is one that can strand a reader with a mangled terminal.
+        // Routing it through the same exit restores the screen either way.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.running = false;
             return Ok(());
@@ -235,9 +248,7 @@ impl App {
             Prompt::AddBook { name } => {
                 if affirmative {
                     let book_id = self.store.add_book(&name)?;
-                    self.store.set_current_book(book_id)?;
-                    self.inform(Tone::Info, format!("Now reading {name}."));
-                    self.go_home();
+                    self.start_reading(book_id)?;
                 } else {
                     self.inform(Tone::Info, format!("{name} was not added."));
                 }
@@ -271,9 +282,9 @@ impl App {
             let sentence = self.input.trim().to_string();
             if sentence.is_empty() {
                 // Nothing typed yet: keep collecting rather than saving a
-                // Sighting with no context, which is the whole point of one.
+                // Sighting with no sentence, which is the whole point of one.
                 self.prompt = Prompt::Sentence { spelling };
-                self.inform(Tone::Warning, "Type the sentence you met the word in.");
+                self.inform(Tone::Warning, "Type the sentence you met the Word in.");
                 return Ok(());
             }
             self.input.clear();
@@ -281,13 +292,13 @@ impl App {
         }
 
         let input = self.input.trim().to_string();
-        if input.is_empty() {
-            return Ok(());
-        }
-
         if input.starts_with('/') {
             self.input.clear();
             return self.run_command(&input);
+        }
+        if input.is_empty() {
+            // Enter on a list opens what is highlighted.
+            return self.pick_book();
         }
 
         // Plain text is a search, and Enter opens what it found.
@@ -317,16 +328,19 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if let Screen::Search { results, selected } = &mut self.screen {
-            if results.is_empty() {
-                return;
-            }
-            let last = results.len() - 1;
-            *selected = match delta {
-                d if d < 0 => selected.saturating_sub(1),
-                _ => (*selected + 1).min(last),
-            };
+        let (length, selected) = match &mut self.screen {
+            Screen::Search { results, selected } => (results.len(), selected),
+            Screen::Library { books, selected } => (books.len(), selected),
+            _ => return,
+        };
+        if length == 0 {
+            return;
         }
+        *selected = if delta < 0 {
+            selected.saturating_sub(1)
+        } else {
+            (*selected + 1).min(length - 1)
+        };
     }
 
     // -- Commands ---------------------------------------------------------
@@ -350,10 +364,7 @@ impl App {
                 Ok(())
             }
             _ => {
-                self.inform(
-                    Tone::Warning,
-                    format!("{name} isn't a command. Try /help."),
-                );
+                self.inform(Tone::Warning, format!("{name} isn't a command. Try /help."));
                 Ok(())
             }
         }
@@ -362,7 +373,7 @@ impl App {
     fn start_capture(&mut self, argument: &str) -> Result<()> {
         let spelling = argument.trim();
         if spelling.is_empty() {
-            self.inform(Tone::Warning, "/add takes the word you met: /add <word>");
+            self.inform(Tone::Warning, "/add takes the Word you met: /add <word>");
             return Ok(());
         }
         if spelling.split_whitespace().count() > 1 {
@@ -372,10 +383,10 @@ impl App {
             );
             return Ok(());
         }
-        if self.store.current_book()?.is_none() {
+        if self.current_book.is_none() {
             self.inform(
                 Tone::Warning,
-                "No Book yet — set one with /book <name> so captures have a source.",
+                "No Book yet — set one with /book <name> so captures have a Book to belong to.",
             );
             return Ok(());
         }
@@ -403,27 +414,31 @@ impl App {
     }
 
     fn capture(&mut self, spelling: &str, sentence: &str) -> Result<()> {
-        let Some(book) = self.store.current_book()? else {
+        let Some(book) = self.current_book.clone() else {
             self.inform(Tone::Warning, "No Book set — nothing was saved.");
             return Ok(());
         };
 
         let word_id = self.store.capture(spelling, book.id, sentence)?;
         self.corpus = self.store.corpus()?;
+        self.current_book = self.store.current_book()?;
 
         let Some(word) = self.store.word(word_id)? else {
             self.inform(Tone::Warning, "That Word could not be read back.");
             return Ok(());
         };
-        let senses_found = !self.dictionary.look_up(&word.spelling)?.is_empty();
+        let defined = !self.dictionary.look_up(&word.spelling)?.is_empty();
         self.show_word(word, Origin::Home)?;
 
-        if senses_found {
+        if defined {
             self.inform(Tone::Info, format!("Captured from {}.", book.name));
         } else {
             self.inform(
                 Tone::Info,
-                format!("Captured from {} — no definition, but the Sighting is kept.", book.name),
+                format!(
+                    "Captured from {} — no Definition, but the Sighting is kept.",
+                    book.name
+                ),
             );
         }
         Ok(())
@@ -432,16 +447,12 @@ impl App {
     fn switch_book(&mut self, argument: &str) -> Result<()> {
         let name = argument.trim();
         if name.is_empty() {
-            self.inform(Tone::Warning, "/book takes the title: /book <name>");
+            self.inform(Tone::Warning, "/book takes the Book's name: /book <name>");
             return Ok(());
         }
 
         match self.store.find_book(name)? {
-            Some(book) => {
-                self.store.set_current_book(book.id)?;
-                self.inform(Tone::Info, format!("Now reading {}.", book.name));
-                self.go_home();
-            }
+            Some(book) => self.start_reading(book.id)?,
             None => {
                 self.prompt = Prompt::AddBook {
                     name: name.to_string(),
@@ -452,9 +463,40 @@ impl App {
     }
 
     fn show_library(&mut self) -> Result<()> {
-        self.screen = Screen::Library {
-            books: self.store.books()?,
+        let books = self.store.books()?;
+        // Open on whatever is being read, so picking is a confirmation rather
+        // than a hunt.
+        let selected = self
+            .current_book
+            .as_ref()
+            .and_then(|current| books.iter().position(|book| book.id == current.id))
+            .unwrap_or(0);
+        self.screen = Screen::Library { books, selected };
+        Ok(())
+    }
+
+    /// Pick the highlighted Book out of the Library and read it.
+    fn pick_book(&mut self) -> Result<()> {
+        let Screen::Library { books, selected } = &self.screen else {
+            return Ok(());
         };
+        let Some(book) = books.get(*selected) else {
+            return Ok(());
+        };
+        let book_id = book.id;
+        self.start_reading(book_id)
+    }
+
+    fn start_reading(&mut self, book_id: i64) -> Result<()> {
+        self.store.set_current_book(book_id)?;
+        self.current_book = self.store.current_book()?;
+        let name = self
+            .current_book
+            .as_ref()
+            .map(|book| book.name.clone())
+            .unwrap_or_default();
+        self.inform(Tone::Info, format!("Now reading {name}."));
+        self.go_home();
         Ok(())
     }
 
@@ -480,11 +522,11 @@ impl App {
     }
 
     fn show_word(&mut self, word: Word, origin: Origin) -> Result<()> {
-        let senses = self.dictionary.look_up(&word.spelling)?;
+        let definitions = self.dictionary.look_up(&word.spelling)?;
         let sightings = self.store.sightings(word.id)?;
         self.screen = Screen::Word(WordView {
             word,
-            senses,
+            definitions,
             sightings,
             origin,
         });
@@ -496,14 +538,6 @@ impl App {
             Origin::Search { query } => {
                 self.input = query;
                 self.input_changed();
-            }
-            Origin::Library => {
-                self.input.clear();
-                if let Ok(books) = self.store.books() {
-                    self.screen = Screen::Library { books };
-                } else {
-                    self.go_home();
-                }
             }
             Origin::Home => self.go_home(),
         }
@@ -554,29 +588,4 @@ pub fn argument_hint(input: &str) -> Option<String> {
         "" => completion.to_string(),
         argument => format!("{completion} {argument}"),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hints_complete_an_unambiguous_command() {
-        assert_eq!(argument_hint("/ad").as_deref(), Some("d <word>"));
-        assert_eq!(argument_hint("/add").as_deref(), Some(" <word>"));
-        assert_eq!(argument_hint("/li").as_deref(), Some("brary"));
-    }
-
-    #[test]
-    fn hints_stop_once_an_argument_is_typed() {
-        assert_eq!(argument_hint("/add pequod"), None);
-    }
-
-    #[test]
-    fn hints_stay_quiet_when_the_command_is_ambiguous_or_unknown() {
-        // Both /add and /book would be guesses for a bare slash.
-        assert_eq!(argument_hint("/"), None);
-        assert_eq!(argument_hint("/nope"), None);
-        assert_eq!(argument_hint("whale"), None);
-    }
 }

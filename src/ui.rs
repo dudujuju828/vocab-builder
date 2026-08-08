@@ -39,7 +39,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
             draw_search(app, frame, content, results, *selected)
         }
         Screen::Word(view) => draw_word(frame, content, view),
-        Screen::Library { books } => draw_library(app, frame, content, books),
+        Screen::Library { books, selected } => draw_library(app, frame, content, books, *selected),
         Screen::Help => draw_help(frame, content),
     }
 
@@ -64,7 +64,7 @@ fn draw_home(app: &App, frame: &mut Frame, area: Rect) {
     lines.push(match app.current_book() {
         Some(book) => Line::from(vec![
             Span::styled("Reading  ", DIM),
-            Span::styled(book.name, Style::new().fg(Color::White)),
+            Span::styled(book.name.clone(), Style::new().fg(Color::White)),
         ]),
         None => Line::from(Span::styled(
             "No Book yet — set one with /book <name>",
@@ -130,8 +130,8 @@ fn draw_search(app: &App, frame: &mut Frame, area: Rect, results: &[SearchResult
             Span::styled(format!("{:width$}  ", result.spelling), style),
             Span::styled(format!("{:9}", result.field.label()), DIM),
         ];
-        if let Some(context) = &result.context {
-            spans.push(Span::styled(format!("  {context}"), DIM));
+        if let Some(excerpt) = &result.excerpt {
+            spans.push(Span::styled(format!("  {excerpt}"), DIM));
         }
         lines.push(Line::from(spans));
     }
@@ -154,17 +154,17 @@ fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
         Line::raw(""),
     ];
 
-    if view.senses.is_empty() {
+    if view.definitions.is_empty() {
         // Say so plainly: a gap in the dictionary, not a failure.
         lines.push(Line::from(Span::styled(
-            "No definition — the bundled dictionary doesn't have this one.",
+            "No Definition — the bundled dictionary doesn't have this one.",
             Style::new().fg(Color::Yellow),
         )));
     } else {
-        for sense in &view.senses {
+        for definition in &view.definitions {
             lines.push(Line::from(vec![
-                Span::styled(format!("({}) ", sense.part_of_speech), DIM),
-                Span::styled(sense.definition.clone(), Style::new().fg(Color::White)),
+                Span::styled(format!("({}) ", definition.part_of_speech), DIM),
+                Span::styled(definition.text.clone(), Style::new().fg(Color::White)),
             ]));
         }
     }
@@ -196,7 +196,6 @@ fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
     lines.push(Line::from(Span::styled(
         match view.origin {
             Origin::Search { .. } => "Esc to go back to your search",
-            Origin::Library => "Esc to go back to your Library",
             Origin::Home => "Esc to go back",
         },
         DIM,
@@ -205,7 +204,7 @@ fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
     paragraph(lines, frame, area);
 }
 
-fn draw_library(app: &App, frame: &mut Frame, area: Rect, books: &[Book]) {
+fn draw_library(app: &App, frame: &mut Frame, area: Rect, books: &[Book], selected: usize) {
     let mut lines = vec![Line::from(Span::styled("Library", HEADING)), Line::raw("")];
 
     if books.is_empty() {
@@ -224,15 +223,16 @@ fn draw_library(app: &App, frame: &mut Frame, area: Rect, books: &[Book]) {
         .max()
         .unwrap_or(0);
 
-    for book in books {
+    for (index, book) in books.iter().enumerate() {
         let reading = Some(book.id) == current;
+        let marker = if index == selected { "›" } else { " " };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:width$}  ", book.name),
-                if reading {
-                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+                format!("{marker} {:width$}  ", book.name),
+                if index == selected {
+                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(Color::White)
+                    Style::new().fg(Color::Gray)
                 },
             ),
             Span::styled(
@@ -242,6 +242,12 @@ fn draw_library(app: &App, frame: &mut Frame, area: Rect, books: &[Book]) {
             Span::styled(if reading { "   ← reading" } else { "" }, DIM),
         ]));
     }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ to choose  ·  Enter to start reading it",
+        DIM,
+    )));
 
     paragraph(lines, frame, area);
 }

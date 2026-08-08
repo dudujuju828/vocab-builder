@@ -46,6 +46,28 @@ fn argument_hints_appear_as_a_command_is_typed() {
 }
 
 #[test]
+fn a_hint_waits_until_one_command_is_meant() {
+    let mut vocab = Harness::new();
+
+    // A bare slash could still become any of them, so nothing is guessed.
+    vocab.type_text("/");
+    assert_eq!(vocab.input_line(), "› /");
+
+    // One more character settles it.
+    vocab.type_text("b");
+    assert_eq!(vocab.input_line(), "› /book <name>");
+}
+
+#[test]
+fn a_hint_stops_once_the_argument_is_being_typed() {
+    let mut vocab = Harness::new();
+
+    vocab.type_text("/add pequod");
+
+    assert_eq!(vocab.input_line(), "› /add pequod");
+}
+
+#[test]
 fn an_unknown_command_says_so_rather_than_searching() {
     let mut vocab = Harness::new();
 
@@ -54,6 +76,28 @@ fn an_unknown_command_says_so_rather_than_searching() {
     vocab.assert_shows("isn't a command");
 }
 
+#[test]
+fn add_on_its_own_says_what_it_needs() {
+    let mut vocab = Harness::new();
+
+    vocab.submit("/add");
+
+    vocab.assert_shows("/add takes the Word you met");
+}
+
+#[test]
+fn a_word_must_be_a_single_word() {
+    let mut vocab = Harness::new();
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+
+    vocab.submit("/add hard cash");
+
+    vocab.assert_shows("A Word is a single word");
+}
+
+/// Quitting is the one behaviour with no expression on screen — the tool is
+/// gone. This is the only assertion in the suite that reads application state
+/// rather than the rendered buffer.
 #[test]
 fn quit_stops_the_tool() {
     let mut vocab = Harness::new();

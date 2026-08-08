@@ -8,12 +8,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::domain::{Book, NoteState, Sighting, Word};
 
-/// Everything about one Word that search matches against.
-pub struct CorpusEntry {
+/// One Word with everything search matches against.
+pub struct CorpusWord {
     pub word_id: i64,
     pub spelling: String,
     pub sentences: Vec<String>,
@@ -33,15 +33,6 @@ impl Store {
         let connection = Connection::open(path)
             .with_context(|| format!("opening the database at {}", path.display()))?;
         let store = Self { connection };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    #[cfg(test)]
-    pub fn in_memory() -> Result<Self> {
-        let store = Self {
-            connection: Connection::open_in_memory()?,
-        };
         store.migrate()?;
         Ok(store)
     }
@@ -81,8 +72,8 @@ impl Store {
                  current_book_id INTEGER REFERENCES books(id)
              );
 
-             -- Populated by the Anki sync in v3. A Word with no row here has
-             -- never been pushed.
+             -- Written by the Anki sync in v3. A Word with no row here has never
+             -- been pushed, which is how v3 finds the backlog v1 left it.
              CREATE TABLE IF NOT EXISTS sync_state (
                  word_id      INTEGER PRIMARY KEY REFERENCES words(id),
                  anki_note_id INTEGER,
@@ -108,28 +99,13 @@ impl Store {
     }
 
     pub fn find_book(&self, name: &str) -> Result<Option<Book>> {
-        let book = self
-            .connection
-            .query_row(
-                "SELECT id, name FROM books WHERE name = ?1 COLLATE NOCASE",
-                [name.trim()],
-                |row| {
-                    Ok(Book {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        word_count: 0,
-                    })
-                },
-            )
-            .optional()?;
-
-        match book {
-            Some(mut book) => {
-                book.word_count = self.word_count(book.id)?;
-                Ok(Some(book))
-            }
-            None => Ok(None),
-        }
+        let name = name.trim();
+        // A Library is a handful of Books, so scanning the list it already
+        // knows how to build beats a second query that counts Words again.
+        Ok(self
+            .books()?
+            .into_iter()
+            .find(|book| book.name.eq_ignore_ascii_case(name)))
     }
 
     /// Every Book, with how many distinct Words came from each.
@@ -153,15 +129,6 @@ impl Store {
         Ok(books)
     }
 
-    fn word_count(&self, book_id: i64) -> Result<usize> {
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(DISTINCT word_id) FROM sightings WHERE book_id = ?1",
-            [book_id],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
     // -- The Current Book -------------------------------------------------
 
     pub fn current_book(&self) -> Result<Option<Book>> {
@@ -174,25 +141,7 @@ impl Store {
             .flatten();
 
         let Some(id) = id else { return Ok(None) };
-
-        let book = self
-            .connection
-            .query_row("SELECT id, name FROM books WHERE id = ?1", [id], |row| {
-                Ok(Book {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    word_count: 0,
-                })
-            })
-            .optional()?;
-
-        match book {
-            Some(mut book) => {
-                book.word_count = self.word_count(book.id)?;
-                Ok(Some(book))
-            }
-            None => Ok(None),
-        }
+        Ok(self.books()?.into_iter().find(|book| book.id == id))
     }
 
     pub fn set_current_book(&self, book_id: i64) -> Result<()> {
@@ -207,33 +156,21 @@ impl Store {
     // -- Words and Sightings ----------------------------------------------
 
     pub fn find_word(&self, spelling: &str) -> Result<Option<Word>> {
-        let word = self
+        Ok(self
             .connection
             .query_row(
                 "SELECT id, spelling FROM words WHERE spelling = ?1 COLLATE NOCASE",
                 [spelling.trim()],
-                |row| {
-                    Ok(Word {
-                        id: row.get(0)?,
-                        spelling: row.get(1)?,
-                    })
-                },
+                to_word,
             )
-            .optional()?;
-        Ok(word)
+            .optional()?)
     }
 
     pub fn word(&self, word_id: i64) -> Result<Option<Word>> {
-        let word = self
+        Ok(self
             .connection
-            .query_row("SELECT id, spelling FROM words WHERE id = ?1", [word_id], |row| {
-                Ok(Word {
-                    id: row.get(0)?,
-                    spelling: row.get(1)?,
-                })
-            })
-            .optional()?;
-        Ok(word)
+            .query_row("SELECT id, spelling FROM words WHERE id = ?1", [word_id], to_word)
+            .optional()?)
     }
 
     /// Record an encounter, creating the Word if this is the first one.
@@ -257,14 +194,6 @@ impl Store {
             "INSERT INTO sightings (word_id, book_id, sentence, captured_at, note_state)
              VALUES (?1, ?2, ?3, ?4, 'pending')",
             params![word_id, book_id, sentence.trim(), now_string()],
-        )?;
-
-        // A Word that gains a Sighting has changed, so v3 pushes it again
-        // rather than creating a second Anki note.
-        self.connection.execute(
-            "INSERT INTO sync_state (word_id, changed) VALUES (?1, 1)
-             ON CONFLICT(word_id) DO UPDATE SET changed = 1",
-            [word_id],
         )?;
 
         Ok(word_id)
@@ -303,7 +232,7 @@ impl Store {
     ///
     /// The corpus is thousands of rows at most, so search rebuilds against
     /// memory rather than maintaining an index.
-    pub fn corpus(&self) -> Result<Vec<CorpusEntry>> {
+    pub fn corpus(&self) -> Result<Vec<CorpusWord>> {
         let mut statement = self.connection.prepare(
             "SELECT words.id, words.spelling, sightings.sentence, books.name
                FROM words
@@ -323,29 +252,36 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut corpus: Vec<CorpusEntry> = Vec::new();
+        let mut corpus: Vec<CorpusWord> = Vec::new();
         for (word_id, spelling, sentence, book) in rows {
-            if corpus.last().map(|entry| entry.word_id) != Some(word_id) {
-                corpus.push(CorpusEntry {
+            if corpus.last().map(|word| word.word_id) != Some(word_id) {
+                corpus.push(CorpusWord {
                     word_id,
                     spelling,
                     sentences: Vec::new(),
                     books: Vec::new(),
                 });
             }
-            let entry = corpus.last_mut().expect("just pushed");
+            let word = corpus.last_mut().expect("just pushed");
             if let Some(sentence) = sentence {
-                entry.sentences.push(sentence);
+                word.sentences.push(sentence);
             }
             if let Some(book) = book
-                && !entry.books.contains(&book)
+                && !word.books.contains(&book)
             {
-                entry.books.push(book);
+                word.books.push(book);
             }
         }
 
         Ok(corpus)
     }
+}
+
+fn to_word(row: &Row<'_>) -> rusqlite::Result<Word> {
+    Ok(Word {
+        id: row.get(0)?,
+        spelling: row.get(1)?,
+    })
 }
 
 fn now_string() -> String {
@@ -359,53 +295,4 @@ fn parse_time(value: &str) -> DateTime<Local> {
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&Local))
         .unwrap_or_else(|_| Local::now())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_word_is_never_duplicated() {
-        let store = Store::in_memory().unwrap();
-        let book = store.add_book("Moby-Dick").unwrap();
-
-        let first = store.capture("pequod", book, "The Pequod sailed.").unwrap();
-        let second = store.capture("Pequod", book, "Aboard the Pequod.").unwrap();
-
-        assert_eq!(first, second, "differing case must reach the same Word");
-        assert_eq!(store.sightings(first).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn corpus_groups_sightings_under_one_word() {
-        let store = Store::in_memory().unwrap();
-        let moby = store.add_book("Moby-Dick").unwrap();
-        let dune = store.add_book("Dune").unwrap();
-        store.capture("cetacean", moby, "A cetacean of note.").unwrap();
-        store.capture("cetacean", dune, "No cetaceans here.").unwrap();
-
-        let corpus = store.corpus().unwrap();
-
-        assert_eq!(corpus.len(), 1);
-        assert_eq!(corpus[0].sentences.len(), 2);
-        assert_eq!(corpus[0].books, vec!["Moby-Dick", "Dune"]);
-    }
-
-    #[test]
-    fn a_word_with_no_sightings_still_appears_in_the_corpus() {
-        let store = Store::in_memory().unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO words (spelling, created_at) VALUES ('orphan', '2026-01-01T00:00:00+00:00')",
-                [],
-            )
-            .unwrap();
-
-        let corpus = store.corpus().unwrap();
-
-        assert_eq!(corpus.len(), 1);
-        assert!(corpus[0].sentences.is_empty());
-    }
 }

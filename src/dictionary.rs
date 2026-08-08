@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::domain::Sense;
+use crate::domain::Definition;
 
 /// Built by `tools/build_dictionary.py` from a Princeton WordNet release.
 const BUNDLED: &[u8] = include_bytes!("../assets/wordnet.db");
@@ -47,12 +47,15 @@ impl Dictionary {
         Ok(Self { connection })
     }
 
-    /// Every sense of `spelling`, most common first.
+    /// Every Definition of `spelling`, most common first.
     ///
     /// Lookup is by exact spelling, case-insensitively. A miss is a normal
     /// outcome — an empty `Vec`, not an error — because a Word absent from
     /// WordNet is still worth capturing.
-    pub fn look_up(&self, spelling: &str) -> Result<Vec<Sense>> {
+    ///
+    /// The table names below are WordNet's own, not the project's vocabulary:
+    /// this is the boundary where one becomes the other.
+    pub fn look_up(&self, spelling: &str) -> Result<Vec<Definition>> {
         let mut statement = self.connection.prepare_cached(
             "SELECT synsets.pos, synsets.definition
                FROM senses
@@ -61,15 +64,15 @@ impl Dictionary {
               ORDER BY senses.sense_num",
         )?;
 
-        let senses = statement
+        let definitions = statement
             .query_map([spelling.trim().to_lowercase()], |row| {
-                Ok(Sense {
+                Ok(Definition {
                     part_of_speech: row.get(0)?,
-                    definition: row.get(1)?,
+                    text: row.get(1)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(senses)
+        Ok(definitions)
     }
 }

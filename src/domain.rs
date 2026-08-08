@@ -70,9 +70,10 @@ impl NoteState {
     }
 }
 
-/// What the bundled dictionary says a Word means. A Word may have several.
+/// What the bundled dictionary says a Word means, independent of where you met
+/// it. A Word may have several, each carrying its part of speech.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Sense {
+pub struct Definition {
     pub part_of_speech: String,
-    pub definition: String,
+    pub text: String,
 }

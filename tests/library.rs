@@ -104,3 +104,40 @@ fn a_reader_with_no_book_is_told_so_on_the_opening_screen() {
 
     vocab.assert_shows("No Book yet");
 }
+
+#[test]
+fn a_book_can_be_picked_out_of_the_library_to_read() {
+    let mut vocab = Harness::new();
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+    vocab.submit("/book Dune").press(KeyCode::Char('y'));
+
+    // The Library is ordered by name, so Moby-Dick sits one step below Dune.
+    vocab.submit("/library").press(KeyCode::Down).enter();
+
+    vocab.assert_shows("Now reading Moby-Dick").assert_shows("Reading Moby-Dick");
+}
+
+#[test]
+fn captures_follow_the_book_picked_out_of_the_library() {
+    let mut vocab = Harness::new();
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+    vocab.submit("/book Dune").press(KeyCode::Char('y'));
+
+    vocab.submit("/library").press(KeyCode::Down).enter();
+    vocab.submit("/add cetacean");
+    vocab.submit("A great cetacean surfaced.");
+
+    vocab.assert_shows("Moby-Dick").assert_does_not_show("Dune");
+}
+
+#[test]
+fn the_library_opens_on_the_book_being_read() {
+    let mut vocab = Harness::new();
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+    vocab.submit("/book Dune").press(KeyCode::Char('y'));
+
+    // Enter without moving picks the highlighted Book, which is the current one.
+    vocab.submit("/library").enter();
+
+    vocab.assert_shows("Now reading Dune");
+}

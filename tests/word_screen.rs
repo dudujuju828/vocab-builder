@@ -17,7 +17,7 @@ fn the_definition_is_always_there() {
 }
 
 #[test]
-fn every_sense_of_the_word_is_shown_with_its_part_of_speech() {
+fn every_definition_is_shown_with_its_part_of_speech() {
     let mut vocab = Harness::new();
     vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
 
@@ -55,15 +55,31 @@ fn sightings_are_ordered_most_recent_first() {
 }
 
 #[test]
-fn leaving_a_word_opened_from_the_library_returns_to_the_library() {
+fn a_word_with_no_definition_still_shows_all_its_sightings() {
+    let mut vocab = Harness::new();
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+    vocab.submit("/add pequod");
+    vocab.submit("The Pequod sailed at dawn.");
+    vocab.submit("/add pequod").press(KeyCode::Char('y'));
+    vocab.submit("The Pequod was gone by morning.");
+
+    vocab
+        .assert_shows("No Definition")
+        .assert_shows("2 Sightings")
+        .assert_shows("The Pequod sailed at dawn.")
+        .assert_shows("The Pequod was gone by morning.");
+}
+
+#[test]
+fn leaving_a_word_opened_from_a_search_returns_to_that_search() {
     let mut vocab = Harness::new();
     vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
     vocab.submit("/add cetacean");
     vocab.submit("A great cetacean surfaced.");
 
-    vocab.submit("/library");
-    vocab.assert_shows("Library");
+    vocab.type_text("cetacean").enter();
+    vocab.assert_shows("large aquatic carnivorous mammal");
 
     vocab.press(KeyCode::Esc);
-    vocab.assert_shows("Reading Moby-Dick");
+    vocab.assert_shows("1 matching Word");
 }
