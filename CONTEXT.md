@@ -30,3 +30,14 @@ The collection of Books known to the tool.
 **Current Book**:
 The Book you are reading right now. Persists across launches, and every new Sighting is attributed to it until you switch.
 _Avoid_: active book, selected book
+
+**Card**:
+A Word as it exists in Anki — one per Word, never one per Sighting. Its front is the Word; its back carries the Definition and every Sighting. Anki's own name for what the tool writes is a *note*, which is why the identifier stored against a Word is an Anki note identifier; here the thing itself is a Card.
+_Avoid_: flashcard, entry, note (which is Anki's word for this, and ours for something else entirely)
+
+**Deck**:
+Where Cards land in Anki. Configurable, and `Vocab` unless you say otherwise.
+
+**Sync**:
+Pushing every Word whose Card is out of date. One-way — Vocab to Anki, never back — and it happens on `/sync` and on the way out.
+_Avoid_: push, upload, export

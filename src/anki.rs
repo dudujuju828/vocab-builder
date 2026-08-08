@@ -65,7 +65,7 @@ impl CardSync for Anki {
             match card.anki_note_id {
                 // Already has a note: update it in place, so a Word that gained
                 // a Sighting enriches its card rather than growing a second.
-                Some(id) => update(&client, id, &card).await.map(|()| id),
+                Some(id) => update(&client, id, &card).await,
                 None => create(&client, &card).await,
             }
         })
@@ -115,10 +115,10 @@ async fn create(client: &Client, card: &Card) -> Pushed {
     created.ok_or_else(|| Unpushed::Refused(anyhow!("Anki added the note but named no identifier")))
 }
 
-async fn update(client: &Client, id: i64, card: &Card) -> Result<(), Unpushed> {
+async fn update(client: &Client, id: i64, card: &Card) -> Pushed {
     // The fields only — the deck a note lives in is the reader's to change, and
     // the sync is one way about content, not about where they filed it.
-    ask::<_, Option<i64>>(
+    let asked = ask::<_, Option<i64>>(
         client,
         Request {
             action: "updateNoteFields",
@@ -134,8 +134,30 @@ async fn update(client: &Client, id: i64, card: &Card) -> Result<(), Unpushed> {
             },
         },
     )
-    .await
-    .map(|_| ())
+    .await;
+
+    match asked {
+        Ok(_) => Ok(id),
+        // The reader deleted the card. The identifier we remember is stale and
+        // nothing done to it will ever work again, so the Word is written back
+        // as a new note — otherwise it would sit in the queue for good, failing
+        // the same way on every sync with no way for the reader to clear it.
+        Err(Unpushed::Refused(complaint)) if note_is_gone(&complaint.to_string()) => {
+            create(client, card).await
+        }
+        Err(unpushed) => Err(unpushed),
+    }
+}
+
+/// Whether Anki's complaint means the note we remember is no longer there.
+///
+/// AnkiConnect answers with prose rather than a code, so this has to read the
+/// prose. It is deliberately narrow: anything it doesn't recognise leaves the
+/// Word queued, which is the safe direction to be wrong in — the alternative
+/// would be writing a second card for a Word that already has one.
+fn note_is_gone(complaint: &str) -> bool {
+    let complaint = complaint.to_lowercase();
+    complaint.contains("note was not found") || complaint.contains("cannot find note")
 }
 
 /// Post one action and read what came back.
@@ -234,4 +256,35 @@ struct Options {
 struct Answer<R> {
     result: Option<R>,
     error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What AnkiConnect actually says when the note has been deleted, wrapped
+    /// the way [`ask`] wraps it.
+    #[test]
+    fn a_deleted_note_is_recognised_from_what_anki_says() {
+        assert!(note_is_gone(
+            "Anki wouldn't updateNoteFields: note was not found: 1700000000000"
+        ));
+        assert!(note_is_gone("Cannot find note with id 1700000000000"));
+    }
+
+    /// Anything else leaves the Word queued rather than writing it a second
+    /// card, because a Word with two cards is the one thing this mapping exists
+    /// to prevent.
+    #[test]
+    fn any_other_complaint_leaves_the_word_queued() {
+        assert!(!note_is_gone(
+            "Anki wouldn't updateNoteFields: collection is not available"
+        ));
+        assert!(!note_is_gone(
+            "Anki wouldn't addNote: deck was not found: Vocab"
+        ));
+        assert!(!note_is_gone(
+            "Anki wouldn't updateNoteFields: model was not found"
+        ));
+    }
 }

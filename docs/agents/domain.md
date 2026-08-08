@@ -4,7 +4,7 @@ How the engineering skills should consume this repo's domain documentation when 
 
 ## Before exploring, read these
 
-- **`CONTEXT.md`** at the repo root — the Vocab glossary (Word, Sighting, Definition, Note, Book, Library, Current Book).
+- **`CONTEXT.md`** at the repo root — the Vocab glossary (Word, Sighting, Definition, Note, Book, Library, Current Book, Card, Deck, Sync).
 - **`docs/adr/`** — read ADRs that touch the area you're about to work in.
 
 If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/domain-modeling` skill (reached via `/grill-with-docs` and `/improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
@@ -21,7 +21,8 @@ This is a **single-context** repo:
 │   │   ├── 0001-bundled-offline-dictionary.md
 │   │   ├── 0002-rust-and-ratatui.md
 │   │   ├── 0003-full-screen-screens-not-a-repl.md
-│   │   └── 0004-deepseek-for-ai-notes.md
+│   │   ├── 0004-deepseek-for-ai-notes.md
+│   │   └── 0005-ankiconnect-over-local-http.md
 │   └── specs/
 └── src/
 ```
