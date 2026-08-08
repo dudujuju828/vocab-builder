@@ -16,7 +16,7 @@ You tell it which Book you're reading once; that Current Book persists across la
 
 Meeting the same Word again doesn't create a duplicate. It adds a Sighting: a second sentence, a second Book, a second date, hanging off the one Word. Two sightings of the same word is a signal, not a mess — it means the word matters and you still didn't know it.
 
-Typing anything that isn't a command searches everything you've captured, updating as you type. It matches the Words themselves, and also the sentences and Book titles, so you can find a word you've forgotten the spelling of by the phrase around it.
+Typing anything that isn't a command searches everything you've captured, updating as you type. It matches the Words themselves, and also the sentences and Book names, so you can find a word you've forgotten the spelling of by the phrase around it.
 
 Behind the offline core, two things reach out. Shortly after each capture, an AI Note is written — a short reading of what that Word is doing in that particular sentence, which the terse dictionary Definition doesn't give you. And the Words sync to Anki as cards, so the retention half happens in the tool that's already good at it.
 
@@ -46,7 +46,7 @@ Behind the offline core, two things reach out. Shortly after each capture, an AI
 14. As a reader, I want to capture a Word with `/add <word>`, so that the command is short enough to type dozens of times without resenting it.
 15. As a reader, I want to be prompted for the sentence after giving the word, so that I'm not composing one long command with quoting rules.
 16. As a reader, I want to paste the sentence rather than retype it when I'm reading on a screen, so that capture stays cheap.
-17. As a reader, I want the Book attributed automatically from my Current Book, so that I never type the book title more than once.
+17. As a reader, I want the Book attributed automatically from my Current Book, so that I never type the Book's name more than once.
 18. As a reader, I want the date recorded automatically, so that I can later see when I met a word.
 19. As a reader, I want to see the Definition immediately after capturing, so that the capture and the lookup are one action rather than two.
 20. As a reader, I want to be able to cancel part-way through a capture, so that a mistyped word doesn't force me to save something wrong.
@@ -56,19 +56,19 @@ Behind the offline core, two things reach out. Shortly after each capture, an AI
 ### Meeting a Word again
 
 23. As a reader, when I capture a Word I already have, I want to be told I already have it and shown where I met it before, so that I get the "I have seen this" signal the tool exists to give me.
-24. As a reader, I want to be asked whether to add another context for that Word, so that the choice is mine rather than the tool's.
-25. As a reader, when I say yes, I want a new Sighting attached to the same Word, so that I never end up with two entries for one word.
+24. As a reader, I want to be asked whether to add another Sighting for that Word, so that the choice is mine rather than the tool's.
+25. As a reader, when I say yes, I want a new Sighting attached to the same Word, so that I never end up with the same Word twice.
 26. As a reader, when I say no, I want the existing Word left exactly as it was, so that declining is safe.
-27. As a reader, I want a Word with several Sightings to appear once in search results, so that recurrence enriches the entry rather than cluttering the list.
+27. As a reader, I want a Word with several Sightings to appear once in search results, so that recurrence enriches the Word rather than cluttering the list.
 
 ### Searching
 
 28. As a reader, I want to search by typing plain text with no command prefix, so that the most common action is the cheapest one.
 29. As a reader, I want results to update on every keystroke, so that I can stop typing the moment I see what I wanted.
-30. As a reader, I want fuzzy matching, so that a half-remembered or misspelled word still finds the entry.
+30. As a reader, I want fuzzy matching, so that a half-remembered or misspelled word still finds the Word.
 31. As a reader, I want Word matches ranked above sentence and Book matches, so that the obvious result is always at the top.
 32. As a reader, I want my search to also match the sentences I captured, so that I can find a word I can't spell by the phrase around it.
-33. As a reader, I want my search to also match Book titles, so that I can pull up everything I captured from one book.
+33. As a reader, I want my search to also match Book names, so that I can pull up everything I captured from one book.
 34. As a reader, I want to see which kind of match each result is, so that a sentence hit isn't mistaken for a word hit.
 35. As a reader, I want to open a result and land on that Word's detail, so that searching flows into reading.
 36. As a reader, I want a clear empty state when nothing matches, so that I can tell "I've never captured this" from "the search is broken" — and that answer is itself useful.
@@ -78,7 +78,7 @@ Behind the offline core, two things reach out. Shortly after each capture, an AI
 37. As a reader, I want a Word's detail screen to show its Definition, so that the primary answer is always there.
 38. As a reader, I want to see every Sighting of that Word, so that I can see the range of ways I've met it.
 39. As a reader, I want each Sighting to show its sentence, its Book, and its date, so that each encounter is anchored in context.
-40. As a reader, I want Sightings ordered with the most recent first, so that the freshest context leads.
+40. As a reader, I want Sightings ordered with the most recent first, so that the freshest Sighting leads.
 41. As a reader, I want to return to where I came from, so that browsing doesn't strand me.
 
 ### AI Notes
@@ -117,7 +117,7 @@ Behind the offline core, two things reach out. Shortly after each capture, an AI
 
 The tool is a single Rust binary using Ratatui, per ADR 0002. It runs in the terminal's alternate screen buffer and presents a set of Screens, each of which wholly replaces the last, per ADR 0003. There is no scrollback and no accumulated session log.
 
-The Screens are: **Home** (splash, Current Book, prompt), **Search** (live results), **Word** (Definition and all Sightings), and **Library** (Books, with capture counts). Capture is a prompt sequence rather than a Screen of its own — it collects the word, then the sentence, then shows the result on the Word screen.
+The Screens are: **Home** (splash, Current Book, prompt), **Search** (live results), **Word** (Definition and all Sightings), **Library** (Books, with capture counts), and **Help** (the command surface). Capture is a prompt sequence rather than a Screen of its own — it collects the word, then the sentence, then shows the result on the Word screen.
 
 The input line is present on every Screen. Text with no leading slash is a search; text with a leading slash is a command. The commands are `/add`, `/book`, `/library`, `/explain`, `/sync`, `/help`, `/quit`. As the user types a command, the argument hint for the matching command is displayed inline.
 
@@ -137,7 +137,7 @@ A Note has three states: **pending** (queued, not yet written), **ready** (writt
 
 ### Dictionary
 
-Definitions come from a WordNet-derived SQLite database bundled with the binary, per ADR 0001. It is read-only and separate from the user database, so it can be replaced wholesale by a new build without touching user data. Lookups are by exact spelling, case-insensitively; a Word may have several senses and each carries its part of speech. A miss is a normal outcome, not an error — the Sighting is stored regardless.
+Definitions come from a WordNet-derived SQLite database bundled with the binary, per ADR 0001. It is read-only and separate from the user database, so it can be replaced wholesale by a new build without touching user data. Lookups are by exact spelling, case-insensitively; a Word may have several Definitions and each carries its part of speech. A miss is a normal outcome, not an error — the Sighting is stored regardless.
 
 ### Search
 
@@ -145,7 +145,7 @@ Search is backed by `nucleo`, matching over three fields: Word spellings, Sighti
 
 ### AI Notes
 
-Note generation sits behind a **`NoteWriter`** interface: given a Word, its sentence, and its Book, return a short reading of the Word in that context. The production implementation calls DeepSeek per ADR 0004.
+Note generation sits behind a **`NoteWriter`** interface: given a Word, its sentence, and its Book, return a short reading of the Word in that Sighting. The production implementation calls DeepSeek per ADR 0004.
 
 Capture never blocks on it. `/add` writes the Sighting with a pending Note and returns; a background task on `tokio` picks up pending Notes and writes them. When one completes, the Word screen updates in place if it is showing that Sighting. `/explain` enqueues the currently-displayed Sighting, overwriting any existing Note — this is the one path that can replace a Note that already succeeded.
 
