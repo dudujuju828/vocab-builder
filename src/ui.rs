@@ -358,3 +358,9 @@ pub(crate) fn plural(count: usize, noun: &str) -> String {
         format!("{noun}s")
     }
 }
+
+/// The verb to go with [`plural`]'s noun — a Word stays queued, two Words stay
+/// queued.
+pub(crate) fn stays(count: usize) -> &'static str {
+    if count == 1 { "stays" } else { "stay" }
+}

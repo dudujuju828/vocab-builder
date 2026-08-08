@@ -200,6 +200,8 @@ struct Setup {
     anki: Anki,
     deck: &'static str,
     sync_on_exit: bool,
+    /// What the configuration file had wrong with it, if anything.
+    complaint: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -209,6 +211,7 @@ impl Default for Setup {
             anki: Anki::Open,
             deck: DEFAULT_DECK,
             sync_on_exit: true,
+            complaint: None,
         }
     }
 }
@@ -288,6 +291,14 @@ impl Harness {
         })
     }
 
+    /// The configuration file couldn't be used, so the defaults are in force.
+    pub fn with_an_unusable_config(complaint: &'static str) -> Self {
+        Self::set_up(Setup {
+            complaint: Some(complaint),
+            ..Setup::default()
+        })
+    }
+
     fn writing(answering: Answering) -> Self {
         Self::set_up(Setup {
             answering: Some(answering),
@@ -332,6 +343,7 @@ impl Harness {
         let config = Config {
             deck: setup.deck.to_string(),
             sync_on_exit: setup.sync_on_exit,
+            complaint: setup.complaint.map(str::to_string),
         };
         let app =
             App::new(store, dictionary(), notes, cards, config).expect("constructing the app");
@@ -455,6 +467,11 @@ impl Harness {
     /// Every card the fake Anki accepted, in the order it was handed them.
     pub fn cards(&self) -> Vec<Card> {
         self.anki.cards()
+    }
+
+    /// What the tool would print once the terminal was the reader's again.
+    pub fn farewell(&self) -> Option<&str> {
+        self.app.farewell()
     }
 
     /// How many of those pushes made a new Anki note rather than updating one

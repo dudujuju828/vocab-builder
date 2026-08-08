@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
             let _inside = runtime.enter();
             vocab::Cards::new(vocab::Anki::on_this_machine()?, runtime.handle().clone())
         };
-        let config = vocab::Config::load_or_create(&directory.join("config.toml"))?;
+        let config = vocab::Config::load_or_create(&directory.join("config.toml"));
         let _app = vocab::App::new(store, dictionary, notes, cards, config)?;
 
         println!("{label}: {:?}", start.elapsed());

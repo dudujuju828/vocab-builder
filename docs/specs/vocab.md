@@ -161,11 +161,15 @@ The mapping is one Anki note per Word. The front is the Word. The back carries t
 
 Sync is one-way: `vocab` to Anki. Edits made in Anki are overwritten on the next push of that Word. The destination deck is configurable and defaults to `Vocab`.
 
-`/sync` pushes every changed Word. Exit also triggers a sync unless the user exits explicitly without one. Anki not running is an expected condition, not an error: the sync is skipped, the Words stay queued, and exit is not delayed. Sync failure must never block quitting.
+`/sync` pushes every changed Word. Exit also triggers a sync unless the user exits explicitly without one — `/quit now`, and Ctrl-C, which is an interrupt and so takes the same path. Anki not running is an expected condition, not an error: the sync is skipped, the Words stay queued, and exit is not delayed. Sync failure must never block quitting, so the wait on the way out is bounded and whatever has not answered by then is left queued.
+
+What a sync did is printed as one line once the terminal has been restored, per ADR 0005 — which records why that deviates from ADR 0003.
 
 ### Configuration
 
 Configuration is a file in the OS configuration directory, covering at minimum the Anki deck name and whether to sync on exit. Secrets are not stored in it — the DeepSeek key is read from the environment.
+
+Reading it cannot fail. A file that is malformed, unreadable, or impossible to write falls back to the defaults and says so once at launch, because an optional settings file must never stand between the reader and capturing a Word.
 
 ## Testing Decisions
 

@@ -18,7 +18,7 @@ use crate::domain::{Book, Definition, Sighting, Word};
 use crate::notes::{NoteOutcome, Notes, Unwritten};
 use crate::search::{Search, SearchResult};
 use crate::store::{CorpusWord, Store};
-use crate::ui::{self, plural};
+use crate::ui::{self, plural, stays};
 
 /// Said once at launch when there is no writer, and again if `/explain` is
 /// asked for something that cannot happen. Never per capture.
@@ -64,7 +64,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "/sync",
         argument: "",
-        help: "push everything that has changed to Anki",
+        help: "send every Word whose Card has changed to Anki",
     },
     Command {
         name: "/help",
@@ -175,6 +175,10 @@ struct Syncing {
     /// Whether anything came back saying Anki wasn't there, which is much the
     /// commonest reason a sync doesn't happen and the one worth naming.
     anki_was_shut: bool,
+    /// Whether this sync has already had its say. Without it, leaving without
+    /// syncing would repeat whatever the last `/sync` reported, as though it
+    /// had just happened.
+    reported: bool,
 }
 
 pub struct App {
@@ -221,6 +225,18 @@ impl App {
             notes.enqueue(request);
         }
 
+        // At most one thing is said at launch, and a settings file that was
+        // ignored leads: the reader wrote it expecting it to take effect, and
+        // has no other way of finding out it didn't.
+        let message = config
+            .complaint
+            .clone()
+            .or_else(|| (!notes.are_on()).then(|| NOTES_ARE_OFF.to_string()))
+            .map(|text| Message {
+                text,
+                tone: Tone::Warning,
+            });
+
         Ok(Self {
             store,
             dictionary,
@@ -230,10 +246,7 @@ impl App {
             screen: Screen::Home,
             input: String::new(),
             prompt: Prompt::None,
-            message: (!notes.are_on()).then(|| Message {
-                text: NOTES_ARE_OFF.to_string(),
-                tone: Tone::Warning,
-            }),
+            message,
             notes,
             cards,
             syncing: Syncing::default(),
@@ -746,7 +759,7 @@ impl App {
     /// call it on every pass.
     pub fn collect_synced(&mut self) -> Result<()> {
         let finished = self.cards.collect();
-        self.took(finished)
+        self.record(finished)
     }
 
     /// Wait for the sync in flight, then take in what came back.
@@ -755,14 +768,15 @@ impl App {
     /// not answered by the deadline is left queued rather than waited on.
     pub async fn settle_sync(&mut self) -> Result<()> {
         let finished = self.cards.settle(PATIENCE_ON_THE_WAY_OUT).await;
-        self.took(finished)?;
+        self.record(finished)?;
         // Said even when nothing came back at all, because a sync that pushed
         // nothing is exactly the one the reader needs telling about.
         self.report_sync();
         Ok(())
     }
 
-    fn took(&mut self, finished: Vec<CardOutcome>) -> Result<()> {
+    /// Write down what came back, and mark the Words that got there.
+    fn record(&mut self, finished: Vec<CardOutcome>) -> Result<()> {
         if finished.is_empty() {
             return Ok(());
         }
@@ -795,11 +809,13 @@ impl App {
             asked,
             pushed,
             anki_was_shut,
+            reported,
             ..
         } = self.syncing;
-        if asked == 0 {
+        if asked == 0 || reported {
             return;
         }
+        self.syncing.reported = true;
 
         // Everything not pushed is queued, whether Anki refused it or never
         // answered at all — there is nowhere else for it to have gone.
@@ -862,6 +878,11 @@ impl App {
     /// the reader while it happens rather than freezing on the last frame drawn.
     /// Finish it with [`App::settle_sync`], which is what bounds the wait.
     pub fn start_leaving(&mut self) -> Result<()> {
+        // What gets printed belongs to this exit and nothing earlier. An exit
+        // that syncs will fill this back in; one that doesn't should be silent
+        // rather than repeat what some `/sync` said ten minutes ago.
+        self.farewell = None;
+
         if !self.sync_on_exit {
             return Ok(());
         }
@@ -929,12 +950,6 @@ impl App {
             tone,
         });
     }
-}
-
-/// "stays" or "stay", so the sentence about what didn't go reads properly
-/// whether it was one Word or several.
-fn stays(count: usize) -> &'static str {
-    if count == 1 { "stays" } else { "stay" }
 }
 
 /// The completion and argument hint for a partly typed command, shown dimmed

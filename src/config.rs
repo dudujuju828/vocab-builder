@@ -23,6 +23,12 @@ pub struct Config {
     pub deck: String,
     /// Whether leaving pushes everything changed.
     pub sync_on_exit: bool,
+    /// What was wrong with the file, if anything — shown once at launch.
+    ///
+    /// Never read from the file itself; it is what this module has to say
+    /// *about* the file.
+    #[serde(skip)]
+    pub complaint: Option<String>,
 }
 
 impl Default for Config {
@@ -30,6 +36,7 @@ impl Default for Config {
         Self {
             deck: DEFAULT_DECK.to_string(),
             sync_on_exit: true,
+            complaint: None,
         }
     }
 }
@@ -57,25 +64,61 @@ sync_on_exit = true
 impl Config {
     /// Read the configuration, writing the default file if there isn't one yet.
     ///
-    /// A file that cannot be parsed is an error rather than a silent fall back
-    /// to the defaults: the reader has just edited it, and quietly ignoring
-    /// what they wrote would be worse than saying so.
-    pub fn load_or_create(path: &Path) -> Result<Self> {
+    /// This cannot fail. Nothing about an optional settings file is worth
+    /// standing between the reader and capturing a Word — a typo in it, a
+    /// directory that can't be written, a file that can't be read: each falls
+    /// back to the defaults and says so once at launch. Being told your deck
+    /// name was ignored is recoverable; a tool that won't start is not.
+    pub fn load_or_create(path: &Path) -> Self {
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text)
-                .with_context(|| format!("reading your configuration at {}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("creating {}", parent.display()))?;
-                }
-                fs::write(path, TEMPLATE).with_context(|| format!("writing {}", path.display()))?;
-                Ok(Self::default())
-            }
-            Err(error) => Err(error)
-                .with_context(|| format!("opening your configuration at {}", path.display())),
+            Ok(text) => match toml::from_str::<Self>(&text) {
+                Ok(config) => config,
+                Err(error) => Self::complaining(format!(
+                    "Ignoring {} — {}",
+                    path.display(),
+                    tersely(&error.to_string())
+                )),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match write(path) {
+                Ok(()) => Self::default(),
+                // The file is a convenience, not a prerequisite. Not being able
+                // to leave one behind changes nothing about this run.
+                Err(error) => Self::complaining(format!(
+                    "Couldn't write {} — {}",
+                    path.display(),
+                    tersely(&error.to_string())
+                )),
+            },
+            Err(error) => Self::complaining(format!(
+                "Ignoring {} — {}",
+                path.display(),
+                tersely(&error.to_string())
+            )),
         }
     }
+
+    fn complaining(complaint: String) -> Self {
+        Self {
+            complaint: Some(format!("{complaint}. Carrying on with the defaults.")),
+            ..Self::default()
+        }
+    }
+}
+
+fn write(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, TEMPLATE).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The first line of a complaint, for a message line one row tall.
+///
+/// TOML errors carry a rendered excerpt of the offending line underneath, which
+/// is useful in a terminal that scrolls and unreadable in a terminal that
+/// doesn't — the file itself is where the reader goes to see the detail.
+fn tersely(error: &str) -> &str {
+    error.lines().next().unwrap_or(error).trim()
 }
 
 #[cfg(test)]
@@ -106,49 +149,73 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("nested").join("config.toml");
 
-        let config = Config::load_or_create(&path).expect("first run");
+        let config = Config::load_or_create(&path);
 
         assert_eq!(config.deck, DEFAULT_DECK);
         assert!(config.sync_on_exit);
+        assert_eq!(config.complaint, None);
         assert!(path.exists(), "the file should be there to be edited");
     }
 
     #[test]
     fn what_the_reader_writes_is_what_is_read_back() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let path = directory.path().join("config.toml");
-        fs::write(&path, "deck = \"Reading\"\nsync_on_exit = false\n").expect("writing");
-
-        let config = Config::load_or_create(&path).expect("reading it back");
+        let config = read("deck = \"Reading\"\nsync_on_exit = false\n");
 
         assert_eq!(config.deck, "Reading");
         assert!(!config.sync_on_exit);
+        assert_eq!(config.complaint, None);
     }
 
     /// Setting one thing shouldn't mean having to state the other.
     #[test]
     fn a_file_that_sets_only_one_setting_keeps_the_default_for_the_rest() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let path = directory.path().join("config.toml");
-        fs::write(&path, "deck = \"Reading\"\n").expect("writing");
-
-        let config = Config::load_or_create(&path).expect("reading it back");
+        let config = read("deck = \"Reading\"\n");
 
         assert_eq!(config.deck, "Reading");
         assert!(config.sync_on_exit);
     }
 
+    /// The reader has just edited this file, so silently ignoring what they
+    /// wrote would leave them wondering why nothing changed.
     #[test]
     fn a_typo_is_pointed_at_rather_than_quietly_ignored() {
+        let config = read("dekc = \"Reading\"\n");
+
+        let complaint = config.complaint.expect("a misspelled setting");
+        assert!(
+            complaint.contains("config.toml"),
+            "the reader needs to be told which file: {complaint}"
+        );
+        assert!(
+            complaint.lines().count() == 1,
+            "the message line is one row tall: {complaint}"
+        );
+    }
+
+    /// The one thing a settings file must never do to a tool whose whole point
+    /// is that capturing a Word is cheap.
+    #[test]
+    fn nothing_the_reader_can_write_in_it_stops_the_tool_starting() {
+        for contents in [
+            "dekc = \"Reading\"",
+            "deck = 3",
+            "deck = \"unclosed",
+            "sync_on_exit = \"yes\"",
+            "[[nonsense]]",
+            "\u{0}\u{1}not toml at all",
+        ] {
+            let config = read(contents);
+
+            assert_eq!(config.deck, DEFAULT_DECK, "for {contents:?}");
+            assert!(config.sync_on_exit, "for {contents:?}");
+            assert!(config.complaint.is_some(), "unremarked: {contents:?}");
+        }
+    }
+
+    fn read(contents: &str) -> Config {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("config.toml");
-        fs::write(&path, "dekc = \"Reading\"\n").expect("writing");
-
-        let error = Config::load_or_create(&path).expect_err("a misspelled setting");
-
-        assert!(
-            format!("{error:#}").contains("config.toml"),
-            "the reader needs to be told which file: {error:#}"
-        );
+        fs::write(&path, contents).expect("writing");
+        Config::load_or_create(&path)
     }
 }

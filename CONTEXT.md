@@ -39,5 +39,5 @@ _Avoid_: flashcard, entry, note (which is Anki's word for this, and ours for som
 Where Cards land in Anki. Configurable, and `Vocab` unless you say otherwise.
 
 **Sync**:
-Pushing every Word whose Card is out of date. One-way — Vocab to Anki, never back — and it happens on `/sync` and on the way out.
-_Avoid_: push, upload, export
+Sending every Word whose Card is out of date to Anki. One-way — Vocab to Anki, never back — and it happens on `/sync` and on the way out. One Card within a Sync is *pushed*; the operation as a whole is a Sync and never a push.
+_Avoid_: upload, export

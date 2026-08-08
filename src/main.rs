@@ -13,7 +13,9 @@ fn main() -> Result<()> {
     let data_directory = data_directory()?;
     let store = Store::open(&data_directory.join("vocab.db"))?;
     let dictionary = Dictionary::unpack_into(&data_directory)?;
-    let config = Config::load_or_create(&config_directory()?.join("config.toml"))?;
+    // Never fatal: whatever is wrong with the settings file, the tool starts and
+    // says so on the message line.
+    let config = Config::load_or_create(&config_directory()?.join("config.toml"));
 
     // One worker thread is plenty: Notes are written one per capture, cards go
     // a handful at a time, and the point of the runtime is only that the reader

@@ -7,8 +7,6 @@
 
 mod harness;
 
-use std::time::{Duration, Instant};
-
 use harness::Harness;
 use ratatui::crossterm::event::KeyCode;
 
@@ -320,19 +318,86 @@ fn a_closed_anki_does_not_hold_up_the_exit() {
 }
 
 /// The stub never answers at all, so without a deadline on the way out this
-/// test would not finish. That it finishes is the assertion.
+/// test would hang for ever. **That it finishes is the assertion** — there is
+/// deliberately no timing assertion here, because the harness runs with the
+/// clock paused, which would make one vacuous. What is bounded is the tool's
+/// waiting, not the wall clock.
 #[test]
 fn a_hanging_anki_does_not_hold_up_the_exit() {
     let mut vocab = captured(Harness::anki_hanging());
 
-    let started = Instant::now();
     vocab.submit("/quit").leave();
 
     assert!(!vocab.is_running());
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "quitting waited {:?} on a connection that never answers",
-        started.elapsed()
-    );
     assert_eq!(vocab.cards().len(), 0);
+    vocab.assert_shows("stays queued");
+}
+
+/// What never answered is still queued, so nothing was lost by having asked.
+#[test]
+fn a_word_a_hanging_anki_never_answered_for_goes_next_time() {
+    let vocab = captured(Harness::anki_hanging());
+    let mut vocab = vocab;
+    vocab.submit("/quit").leave();
+
+    let mut vocab = vocab.restart();
+    vocab.anki_opens();
+    vocab.submit("/sync").settle();
+
+    assert_eq!(vocab.cards().len(), 1);
+}
+
+// -- Being told the truth on the way out ----------------------------------
+
+/// Leaving without syncing must not repeat what the last `/sync` said, as
+/// though it had just happened again.
+#[test]
+fn quit_now_does_not_claim_credit_for_an_earlier_sync() {
+    let mut vocab = captured(Harness::new());
+    vocab.submit("/sync").settle();
+    assert_eq!(vocab.farewell(), Some("Synced 1 Word to Anki."));
+
+    vocab.submit("/quit now").leave();
+
+    assert_eq!(vocab.farewell(), None);
+}
+
+#[test]
+fn an_exit_that_syncs_nothing_because_it_was_turned_off_says_nothing() {
+    let mut vocab = captured(Harness::without_sync_on_exit());
+
+    vocab.submit("/quit").leave();
+
+    assert_eq!(vocab.farewell(), None);
+}
+
+#[test]
+fn an_exit_that_synced_says_so_where_it_can_still_be_read() {
+    let mut vocab = captured(Harness::new());
+
+    vocab.submit("/quit").leave();
+
+    assert_eq!(vocab.farewell(), Some("Synced 1 Word to Anki."));
+}
+
+// -- A settings file that can't be used ------------------------------------
+
+/// The tool's whole promise is that capturing a Word is cheap. An optional
+/// settings file is never worth standing between the reader and that.
+#[test]
+fn an_unusable_config_is_reported_but_does_not_stop_anything() {
+    let mut vocab = Harness::with_an_unusable_config(
+        "Ignoring config.toml — unknown field `dekc`. Carrying on with the defaults.",
+    );
+
+    vocab.assert_shows("Ignoring config.toml");
+
+    vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
+    vocab.submit("/add cetacean");
+    vocab.submit("A great cetacean surfaced beside the boat.");
+    vocab.submit("/sync").settle();
+
+    vocab.assert_shows("Synced 1 Word to Anki");
+    // The defaults are what is in force, and they are ordinary defaults.
+    assert_eq!(vocab.cards()[0].deck, "Vocab");
 }

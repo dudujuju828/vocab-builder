@@ -297,12 +297,21 @@ impl Store {
         // The Note goes on the card, so the card is now out of date. A Note
         // arriving after a sync is the ordinary case, not an unusual one: it is
         // written in the background, well after the Sighting it belongs to.
-        self.connection.execute(
-            "UPDATE sync_state SET changed = changed + 1
-              WHERE word_id = (SELECT word_id FROM sightings WHERE id = ?1)",
-            [sighting_id],
-        )?;
+        if let Some(word_id) = self.word_of(sighting_id)? {
+            self.mark_card_changed(word_id)?;
+        }
         Ok(())
+    }
+
+    fn word_of(&self, sighting_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT word_id FROM sightings WHERE id = ?1",
+                [sighting_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Mark an attempt as having errored. The Sighting itself is untouched —
@@ -357,9 +366,11 @@ impl Store {
 
     /// Note that a Word's card no longer says what the Word says.
     ///
-    /// The upsert is for the Word that has only just been inserted, which has
-    /// no row of its own yet.
-    pub fn mark_card_changed(&self, word_id: i64) -> Result<()> {
+    /// The one place that records this, so the two things that change a card —
+    /// a Sighting and a Note — cannot come to disagree about how it is written
+    /// down. The upsert is for the Word that has only just been inserted and
+    /// has no row of its own yet.
+    fn mark_card_changed(&self, word_id: i64) -> Result<()> {
         self.connection.execute(
             "INSERT INTO sync_state (word_id, changed) VALUES (?1, 1)
              ON CONFLICT(word_id) DO UPDATE SET changed = sync_state.changed + 1",
