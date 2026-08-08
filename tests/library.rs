@@ -20,7 +20,9 @@ fn accepting_adds_the_book_and_starts_reading_it() {
 
     vocab.submit("/book Moby-Dick").press(KeyCode::Char('y'));
 
-    vocab.assert_shows("Now reading Moby-Dick").assert_shows("Reading Moby-Dick");
+    vocab
+        .assert_shows("Now reading Moby-Dick")
+        .assert_shows("Reading Moby-Dick");
 }
 
 #[test]
@@ -114,7 +116,9 @@ fn a_book_can_be_picked_out_of_the_library_to_read() {
     // The Library is ordered by name, so Moby-Dick sits one step below Dune.
     vocab.submit("/library").press(KeyCode::Down).enter();
 
-    vocab.assert_shows("Now reading Moby-Dick").assert_shows("Reading Moby-Dick");
+    vocab
+        .assert_shows("Now reading Moby-Dick")
+        .assert_shows("Reading Moby-Dick");
 }
 
 #[test]

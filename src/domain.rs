@@ -25,9 +25,9 @@ pub struct Sighting {
     pub sentence: String,
     pub book_name: String,
     pub captured_at: DateTime<Local>,
-    /// The AI's reading of this Word in this sentence. Written in v2; always
-    /// `None` until then, with every Sighting left [`NoteState::Pending`] so the
-    /// backlog drains once a `NoteWriter` exists.
+    /// The AI's reading of this Word in this sentence — a second opinion beside
+    /// the Definition, never a replacement for it. `None` until the writer has
+    /// answered, which is what [`NoteState`] distinguishes.
     pub note: Option<String>,
     pub note_state: NoteState,
 }

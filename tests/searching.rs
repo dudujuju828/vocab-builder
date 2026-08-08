@@ -90,7 +90,9 @@ fn word_matches_are_ranked_above_sentence_matches() {
 fn sentence_matches_are_ranked_above_book_matches() {
     let mut vocab = Harness::new();
     // The Book name is the query, so every Word in it matches on the Book band.
-    vocab.submit("/book Cetacean Weekly").press(KeyCode::Char('y'));
+    vocab
+        .submit("/book Cetacean Weekly")
+        .press(KeyCode::Char('y'));
     vocab.submit("/add doubloon");
     vocab.submit("He nailed it to the mast.");
     vocab.submit("/add sonorous");

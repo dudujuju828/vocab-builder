@@ -13,12 +13,18 @@ fn main() -> anyhow::Result<()> {
     let directory = std::env::temp_dir().join("vocab-startup-probe");
     let _ = std::fs::remove_dir_all(&directory);
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+
     for label in ["cold (unpacks the dictionary)", "warm"] {
         let start = Instant::now();
 
         let store = vocab::Store::open(&directory.join("vocab.db"))?;
         let dictionary = vocab::Dictionary::unpack_into(&directory)?;
-        let _app = vocab::App::new(store, dictionary)?;
+        let notes = vocab::Notes::new(None, runtime.handle().clone());
+        let _app = vocab::App::new(store, dictionary, notes)?;
 
         println!("{label}: {:?}", start.elapsed());
     }

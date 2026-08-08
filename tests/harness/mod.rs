@@ -6,20 +6,24 @@
 //! would see; none of them call into the application's internals or inspect
 //! database rows.
 //!
-//! Of the three injected dependencies, only fakes-in-waiting would be faked:
-//! the user database is a real SQLite file in a temporary directory, fresh per
-//! test, and the dictionary is the real bundled WordNet, which is read-only and
-//! deterministic.
+//! Of the four injected dependencies, only one is faked: the user database is a
+//! real SQLite file in a temporary directory, fresh per test, and the dictionary
+//! is the real bundled WordNet, which is read-only and deterministic. Only the
+//! `NoteWriter` is a stub, because the alternative is the network.
 
 #![allow(dead_code)] // Each integration test file uses a different subset.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tempfile::TempDir;
+use tokio::runtime::Runtime;
+use vocab::notes::{BoxedNote, NoteRequest, NoteWriter, Notes};
 use vocab::{App, Dictionary, Store};
 
 const WIDTH: u16 = 100;
@@ -39,38 +43,134 @@ fn dictionary() -> Dictionary {
     Dictionary::open(&directory.join("wordnet.db")).expect("opening the bundled dictionary")
 }
 
+/// The one fake: a `NoteWriter` that never leaves the process.
+///
+/// The Note it returns echoes back the Word, the Book, and the sentence it was
+/// handed, so a test can tell from the screen alone that all three reached the
+/// writer. It is numbered, so a rewritten Note is distinguishable from the one
+/// it replaced.
+pub struct StubWriter {
+    attempts: AtomicUsize,
+    working: AtomicBool,
+}
+
+impl StubWriter {
+    fn new(working: bool) -> Self {
+        Self {
+            attempts: AtomicUsize::new(0),
+            working: AtomicBool::new(working),
+        }
+    }
+
+    /// Let a writer that has been failing start succeeding, so a test can watch
+    /// a failed Note be retried.
+    fn recover(&self) {
+        self.working.store(true, Ordering::SeqCst);
+    }
+}
+
+impl NoteWriter for StubWriter {
+    fn write(&self, request: NoteRequest) -> BoxedNote {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        let working = self.working.load(Ordering::SeqCst);
+        Box::pin(async move {
+            anyhow::ensure!(working, "this stub was asked to fail");
+            Ok(format!(
+                "reading {attempt} of {:?} from {}: {}",
+                request.spelling, request.book_name, request.sentence
+            ))
+        })
+    }
+}
+
 pub struct Harness {
     app: App,
     terminal: Terminal<TestBackend>,
     directory: TempDir,
+    /// Single-threaded and driven only by [`Harness::settle`], so a Note is
+    /// written exactly when a test says so and never before.
+    runtime: Runtime,
+    writer: Option<Arc<StubWriter>>,
 }
 
 impl Harness {
+    /// Notes on, and the writer answers every time.
     pub fn new() -> Self {
-        let directory = tempfile::tempdir().expect("creating a temporary directory");
-        Self::open_in(directory)
+        Self::writing(Some(StubWriter::new(true)))
     }
 
-    fn open_in(directory: TempDir) -> Self {
+    /// Notes on, but every attempt errors — the network is down.
+    pub fn failing() -> Self {
+        Self::writing(Some(StubWriter::new(false)))
+    }
+
+    /// No writer at all, as when the API key is missing.
+    pub fn without_notes() -> Self {
+        Self::writing(None)
+    }
+
+    fn writing(writer: Option<StubWriter>) -> Self {
+        let directory = tempfile::tempdir().expect("creating a temporary directory");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("building the runtime");
+        Self::open_in(directory, runtime, writer.map(Arc::new))
+    }
+
+    fn open_in(directory: TempDir, runtime: Runtime, writer: Option<Arc<StubWriter>>) -> Self {
         let store = Store::open(&directory.path().join("vocab.db")).expect("opening the store");
-        let app = App::new(store, dictionary()).expect("constructing the app");
+        let notes = Notes::new(
+            writer.clone().map(|writer| writer as Arc<dyn NoteWriter>),
+            runtime.handle().clone(),
+        );
+        let app = App::new(store, dictionary(), notes).expect("constructing the app");
         let terminal =
             Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("constructing the terminal");
         Self {
             app,
             terminal,
             directory,
+            runtime,
+            writer,
         }
     }
 
     /// Close the tool and open it again against the same database, as a reader
-    /// would between reading sessions.
+    /// would between reading sessions. The writer carries over, so a test can
+    /// tell whether it was asked for the same Note twice.
     pub fn restart(self) -> Self {
-        let Self { directory, .. } = self;
-        Self::open_in(directory)
+        let Self {
+            directory,
+            runtime,
+            writer,
+            ..
+        } = self;
+        Self::open_in(directory, runtime, writer)
     }
 
     // -- Driving ----------------------------------------------------------
+
+    /// Drive every Note in flight to completion and apply what came back.
+    ///
+    /// This is what keeps the asynchronous half of the tool testable through
+    /// the same screen seam as everything else: no sleeping, no polling, and no
+    /// second seam onto the Note pipeline.
+    pub fn settle(&mut self) -> &mut Self {
+        let Self { app, runtime, .. } = self;
+        runtime
+            .block_on(app.settle_notes())
+            .expect("settling the Notes in flight");
+        self
+    }
+
+    /// Let a failing writer start answering.
+    pub fn notes_recover(&mut self) -> &mut Self {
+        self.writer
+            .as_ref()
+            .expect("a stub writer to recover")
+            .recover();
+        self
+    }
 
     pub fn type_text(&mut self, text: &str) -> &mut Self {
         for character in text.chars() {
@@ -100,6 +200,9 @@ impl Harness {
             ..event
         };
         self.app.handle_key(event).expect("handling a key event");
+        // The real loop looks for finished Notes on every pass; nothing is
+        // waited on, so an unsettled Note stays pending.
+        self.app.collect_notes().expect("collecting finished Notes");
         self
     }
 
@@ -163,9 +266,10 @@ impl Harness {
     pub fn assert_shows_in_order(&mut self, first: &str, second: &str) -> &mut Self {
         let screen = self.screen();
         let flattened = flatten(&screen);
-        let (Some(above), Some(below)) =
-            (flattened.find(&flatten(first)), flattened.find(&flatten(second)))
-        else {
+        let (Some(above), Some(below)) = (
+            flattened.find(&flatten(first)),
+            flattened.find(&flatten(second)),
+        ) else {
             panic!(
                 "expected the screen to show both {first:?} and {second:?}\
                  \n\n--- screen ---\n{screen}\n--------------"

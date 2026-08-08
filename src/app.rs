@@ -11,9 +11,14 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::dictionary::Dictionary;
 use crate::domain::{Book, Definition, Sighting, Word};
+use crate::notes::{NoteOutcome, Notes};
 use crate::search::{Search, SearchResult};
 use crate::store::{CorpusWord, Store};
 use crate::ui;
+
+/// Said once at launch when there is no writer, and again if `/explain` is
+/// asked for something that cannot happen. Never per capture.
+const NOTES_ARE_OFF: &str = "Notes are off — set DEEPSEEK_API_KEY to have them written.";
 
 /// The command surface. Listed by `/help`, and the source of the argument hints
 /// shown as a command is typed.
@@ -38,6 +43,11 @@ pub const COMMANDS: &[Command] = &[
         name: "/library",
         argument: "",
         help: "list every Book you have added",
+    },
+    Command {
+        name: "/explain",
+        argument: "",
+        help: "write the Note for the Sighting you are on again",
     },
     Command {
         name: "/help",
@@ -73,6 +83,9 @@ pub struct WordView {
     pub word: Word,
     pub definitions: Vec<Definition>,
     pub sightings: Vec<Sighting>,
+    /// Which Sighting `/explain` would ask about again. Sightings run most
+    /// recent first, so the freshest one leads.
+    pub selected: usize,
     /// Where this screen was opened from, so leaving it returns there.
     pub origin: Origin,
 }
@@ -88,11 +101,17 @@ pub enum Origin {
 pub enum Prompt {
     None,
     /// The Word is known; collecting the sentence it was met in.
-    Sentence { spelling: String },
+    Sentence {
+        spelling: String,
+    },
     /// This Word is already held — add another Sighting for it?
-    AnotherSighting { spelling: String },
+    AnotherSighting {
+        spelling: String,
+    },
     /// This Book is not in the Library yet — add it?
-    AddBook { name: String },
+    AddBook {
+        name: String,
+    },
 }
 
 impl Prompt {
@@ -130,6 +149,7 @@ pub struct Message {
 pub struct App {
     store: Store,
     dictionary: Dictionary,
+    notes: Notes,
     search: Search,
     corpus: Vec<CorpusWord>,
     /// Held rather than queried, so rendering never touches the database and a
@@ -143,9 +163,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(store: Store, dictionary: Dictionary) -> Result<Self> {
+    pub fn new(store: Store, dictionary: Dictionary, mut notes: Notes) -> Result<Self> {
         let corpus = store.corpus()?;
         let current_book = store.current_book()?;
+
+        // Whatever was still queued when the tool last closed is picked up now.
+        // Notes that failed are not: those are the reader's to retry, so that a
+        // real failure stays visible rather than being quietly re-attempted on
+        // every launch.
+        for request in store.pending_notes()? {
+            notes.enqueue(request);
+        }
+
         Ok(Self {
             store,
             dictionary,
@@ -155,7 +184,11 @@ impl App {
             screen: Screen::Home,
             input: String::new(),
             prompt: Prompt::None,
-            message: None,
+            message: (!notes.are_on()).then(|| Message {
+                text: NOTES_ARE_OFF.to_string(),
+                tone: Tone::Warning,
+            }),
+            notes,
             running: true,
         })
     }
@@ -232,7 +265,10 @@ impl App {
     /// capture.
     fn answer_prompt(&mut self, key: KeyEvent) -> Result<()> {
         let affirmative = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
-        let negative = matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc);
+        let negative = matches!(
+            key.code,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc
+        );
         if !affirmative && !negative {
             return Ok(());
         }
@@ -331,6 +367,7 @@ impl App {
         let (length, selected) = match &mut self.screen {
             Screen::Search { results, selected } => (results.len(), selected),
             Screen::Library { books, selected } => (books.len(), selected),
+            Screen::Word(view) => (view.sightings.len(), &mut view.selected),
             _ => return,
         };
         if length == 0 {
@@ -355,6 +392,7 @@ impl App {
             "/add" => self.start_capture(argument),
             "/book" => self.switch_book(argument),
             "/library" => self.show_library(),
+            "/explain" => self.explain(),
             "/help" => {
                 self.screen = Screen::Help;
                 Ok(())
@@ -419,11 +457,17 @@ impl App {
             return Ok(());
         };
 
-        let word_id = self.store.capture(spelling, book.id, sentence)?;
+        let captured = self.store.capture(spelling, book.id, sentence)?;
         self.corpus = self.store.corpus()?;
         self.current_book = self.store.current_book()?;
 
-        let Some(word) = self.store.word(word_id)? else {
+        // Queued, not waited on: the Sighting is already safe, and the Note
+        // arrives on the screen the reader is already looking at.
+        if let Some(request) = self.store.note_request(captured.sighting_id)? {
+            self.notes.enqueue(request);
+        }
+
+        let Some(word) = self.store.word(captured.word_id)? else {
             self.inform(Tone::Warning, "That Word could not be read back.");
             return Ok(());
         };
@@ -500,6 +544,86 @@ impl App {
         Ok(())
     }
 
+    // -- Notes ------------------------------------------------------------
+
+    /// Ask again about the Sighting being looked at.
+    ///
+    /// This is the one path that discards a Note that was written successfully:
+    /// everywhere else a ready Note stays put.
+    fn explain(&mut self) -> Result<()> {
+        let Screen::Word(view) = &self.screen else {
+            self.inform(
+                Tone::Warning,
+                "/explain rewrites a Sighting's Note — open a Word first.",
+            );
+            return Ok(());
+        };
+        let Some(sighting) = view.sightings.get(view.selected) else {
+            self.inform(Tone::Warning, "There is no Sighting to explain.");
+            return Ok(());
+        };
+        if !self.notes.are_on() {
+            self.inform(Tone::Warning, NOTES_ARE_OFF);
+            return Ok(());
+        }
+
+        let sighting_id = sighting.id;
+        self.store.queue_note(sighting_id)?;
+        if let Some(request) = self.store.note_request(sighting_id)? {
+            self.notes.enqueue(request);
+        }
+        // Re-read straight away, so the Sighting shows as pending from the
+        // moment it was asked about rather than once the answer lands.
+        self.reread_sightings()?;
+        self.inform(Tone::Info, "Asking again…");
+        Ok(())
+    }
+
+    /// Take in every Note that has finished. Never waits, so the event loop can
+    /// call it on every pass.
+    pub fn collect_notes(&mut self) -> Result<()> {
+        let finished = self.notes.collect();
+        self.absorb(finished)
+    }
+
+    /// Wait for every Note in flight, then take them all in.
+    ///
+    /// Tests drive the background work to completion through this rather than
+    /// sleeping or polling.
+    pub async fn settle_notes(&mut self) -> Result<()> {
+        let finished = self.notes.settle().await;
+        self.absorb(finished)
+    }
+
+    fn absorb(&mut self, finished: Vec<NoteOutcome>) -> Result<()> {
+        if finished.is_empty() {
+            return Ok(());
+        }
+        for outcome in finished {
+            match outcome.note {
+                Ok(note) => self.store.write_note(outcome.sighting_id, &note)?,
+                // The Sighting is left exactly as it was. A failure costs the
+                // reading, never the capture.
+                Err(_) => self.store.fail_note(outcome.sighting_id)?,
+            }
+        }
+        // The Note should feel like it arrived, so a Word already on screen is
+        // re-read in place rather than on the reader's next visit.
+        self.reread_sightings()
+    }
+
+    fn reread_sightings(&mut self) -> Result<()> {
+        let Screen::Word(view) = &self.screen else {
+            return Ok(());
+        };
+        let sightings = self.store.sightings(view.word.id)?;
+        if let Screen::Word(view) = &mut self.screen {
+            view.selected = view.selected.min(sightings.len().saturating_sub(1));
+            view.sightings = sightings;
+        }
+        Ok(())
+    }
+
     // -- Screens ----------------------------------------------------------
 
     fn open_selected(&mut self) -> Result<()> {
@@ -528,6 +652,7 @@ impl App {
             word,
             definitions,
             sightings,
+            selected: 0,
             origin,
         });
         Ok(())

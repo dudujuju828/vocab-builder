@@ -7,10 +7,12 @@
 pub mod app;
 pub mod dictionary;
 pub mod domain;
+pub mod notes;
 pub mod search;
 pub mod store;
 pub mod ui;
 
 pub use app::App;
 pub use dictionary::Dictionary;
+pub use notes::Notes;
 pub use store::Store;

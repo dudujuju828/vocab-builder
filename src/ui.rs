@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{App, COMMANDS, Origin, Prompt, Screen, Tone, WordView, argument_hint};
-use crate::domain::Book;
+use crate::domain::{Book, NoteState, Sighting};
 use crate::search::SearchResult;
 
 const SPLASH: &[&str] = &[
@@ -21,9 +21,7 @@ const SPLASH: &[&str] = &[
 ];
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
-const HEADING: Style = Style::new()
-    .fg(Color::Yellow)
-    .add_modifier(Modifier::BOLD);
+const HEADING: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
 pub fn draw(app: &App, frame: &mut Frame) {
     let [content, message, input] = Layout::vertical([
@@ -80,7 +78,13 @@ fn draw_home(app: &App, frame: &mut Frame, area: Rect) {
     paragraph(lines, frame, area);
 }
 
-fn draw_search(app: &App, frame: &mut Frame, area: Rect, results: &[SearchResult], selected: usize) {
+fn draw_search(
+    app: &App,
+    frame: &mut Frame,
+    area: Rect,
+    results: &[SearchResult],
+    selected: usize,
+) {
     let query = app.input().trim();
 
     if results.is_empty() {
@@ -104,7 +108,11 @@ fn draw_search(app: &App, frame: &mut Frame, area: Rect, results: &[SearchResult
 
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("{} matching {}", results.len(), plural(results.len(), "Word")),
+            format!(
+                "{} matching {}",
+                results.len(),
+                plural(results.len(), "Word")
+            ),
             HEADING,
         )),
         Line::raw(""),
@@ -179,29 +187,52 @@ fn draw_word(frame: &mut Frame, area: Rect, view: &WordView) {
         HEADING,
     )));
 
-    for sighting in &view.sightings {
+    for (index, sighting) in view.sightings.iter().enumerate() {
+        let marker = if index == view.selected { "› " } else { "  " };
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
+            Span::styled(marker, Style::new().fg(Color::White)),
             Span::styled(sighting.captured_on(), DIM),
             Span::styled("  ·  ", DIM),
             Span::styled(sighting.book_name.clone(), Style::new().fg(Color::Green)),
         ]));
         lines.push(Line::from(Span::styled(
-            sighting.sentence.clone(),
+            format!("  {}", sighting.sentence),
             Style::new().fg(Color::White),
         )));
+        lines.push(note_line(sighting));
     }
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        match view.origin {
-            Origin::Search { .. } => "Esc to go back to your search",
-            Origin::Home => "Esc to go back",
-        },
+        format!(
+            "↑↓ to choose a Sighting  ·  /explain rewrites its Note  ·  {}",
+            match view.origin {
+                Origin::Search { .. } => "Esc to go back to your search",
+                Origin::Home => "Esc to go back",
+            }
+        ),
         DIM,
     )));
 
     paragraph(lines, frame, area);
+}
+
+/// The Note for one Sighting, labelled so it reads as a second opinion rather
+/// than as part of the Definition — and never as an empty space.
+fn note_line(sighting: &Sighting) -> Line<'static> {
+    let label = Span::styled("  Note  ", Style::new().fg(Color::Magenta));
+    let body = match (sighting.note_state, &sighting.note) {
+        (NoteState::Ready, Some(note)) => Span::styled(note.clone(), Style::new().fg(Color::Gray)),
+        (NoteState::Failed, _) => Span::styled(
+            "couldn't be written — /explain to ask again".to_string(),
+            Style::new().fg(Color::Yellow),
+        ),
+        // A Note recorded as ready but missing is a hand-edited database; say
+        // pending, which is at least true of what will happen next.
+        _ => Span::styled("pending…".to_string(), DIM),
+    };
+    Line::from(vec![label, body])
 }
 
 fn draw_library(app: &App, frame: &mut Frame, area: Rect, books: &[Book], selected: usize) {
@@ -264,10 +295,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     for command in COMMANDS {
         let surface = format!("{} {}", command.name, command.argument);
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("{surface:width$}  "),
-                Style::new().fg(Color::Cyan),
-            ),
+            Span::styled(format!("{surface:width$}  "), Style::new().fg(Color::Cyan)),
             Span::styled(command.help, Style::new().fg(Color::White)),
         ]));
     }
@@ -295,7 +323,10 @@ fn draw_message(app: &App, frame: &mut Frame, area: Rect) {
 
 fn draw_input(app: &App, frame: &mut Frame, area: Rect) {
     let mut spans = match app.prompt().label() {
-        Some(label) => vec![Span::styled(format!("{label} "), Style::new().fg(Color::Yellow))],
+        Some(label) => vec![Span::styled(
+            format!("{label} "),
+            Style::new().fg(Color::Yellow),
+        )],
         None => vec![Span::styled("› ", Style::new().fg(Color::Cyan))],
     };
 

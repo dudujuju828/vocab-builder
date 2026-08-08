@@ -11,6 +11,13 @@ use chrono::{DateTime, Local};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::domain::{Book, NoteState, Sighting, Word};
+use crate::notes::NoteRequest;
+
+/// What one capture created: the Word it belongs to, and the Sighting itself.
+pub struct Captured {
+    pub word_id: i64,
+    pub sighting_id: i64,
+}
 
 /// One Word with everything search matches against.
 pub struct CorpusWord {
@@ -134,9 +141,11 @@ impl Store {
     pub fn current_book(&self) -> Result<Option<Book>> {
         let id: Option<i64> = self
             .connection
-            .query_row("SELECT current_book_id FROM app_state WHERE id = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT current_book_id FROM app_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
             .optional()?
             .flatten();
 
@@ -169,15 +178,20 @@ impl Store {
     pub fn word(&self, word_id: i64) -> Result<Option<Word>> {
         Ok(self
             .connection
-            .query_row("SELECT id, spelling FROM words WHERE id = ?1", [word_id], to_word)
+            .query_row(
+                "SELECT id, spelling FROM words WHERE id = ?1",
+                [word_id],
+                to_word,
+            )
             .optional()?)
     }
 
     /// Record an encounter, creating the Word if this is the first one.
     ///
-    /// The Note is left pending: no Note is written in v1, and a pending row is
-    /// exactly what the v2 background writer picks up on next launch.
-    pub fn capture(&self, spelling: &str, book_id: i64, sentence: &str) -> Result<i64> {
+    /// The Note is left pending. Capture never waits on one, and a pending row
+    /// is exactly what the background writer picks up — now if it is running,
+    /// on the next launch if it is not.
+    pub fn capture(&self, spelling: &str, book_id: i64, sentence: &str) -> Result<Captured> {
         let spelling = spelling.trim();
         let word_id = match self.find_word(spelling)? {
             Some(word) => word.id,
@@ -196,7 +210,10 @@ impl Store {
             params![word_id, book_id, sentence.trim(), now_string()],
         )?;
 
-        Ok(word_id)
+        Ok(Captured {
+            word_id,
+            sighting_id: self.connection.last_insert_rowid(),
+        })
     }
 
     /// Every Sighting of a Word, most recent first.
@@ -226,6 +243,65 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(sightings)
+    }
+
+    // -- Notes ------------------------------------------------------------
+
+    /// Every Sighting still waiting for a Note, oldest first.
+    ///
+    /// This is the backlog: what was queued when the tool last closed, in the
+    /// order it was captured.
+    pub fn pending_notes(&self) -> Result<Vec<NoteRequest>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{NOTE_REQUEST} WHERE sightings.note_state = 'pending'
+              ORDER BY sightings.captured_at, sightings.id"
+        ))?;
+        let requests = statement
+            .query_map([], to_note_request)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(requests)
+    }
+
+    /// What a writer needs in order to read one Sighting.
+    pub fn note_request(&self, sighting_id: i64) -> Result<Option<NoteRequest>> {
+        Ok(self
+            .connection
+            .query_row(
+                &format!("{NOTE_REQUEST} WHERE sightings.id = ?1"),
+                [sighting_id],
+                to_note_request,
+            )
+            .optional()?)
+    }
+
+    pub fn write_note(&self, sighting_id: i64, note: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sightings SET note = ?2, note_state = 'ready' WHERE id = ?1",
+            params![sighting_id, note.trim()],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an attempt as having errored. The Sighting itself is untouched —
+    /// the network can never cost a capture.
+    pub fn fail_note(&self, sighting_id: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sightings SET note_state = 'failed' WHERE id = ?1",
+            [sighting_id],
+        )?;
+        Ok(())
+    }
+
+    /// Put a Sighting back in the queue, clearing whatever Note it had.
+    ///
+    /// This is the one path that discards a Note that was written successfully,
+    /// and it is only ever reached through `/explain`.
+    pub fn queue_note(&self, sighting_id: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sightings SET note = NULL, note_state = 'pending' WHERE id = ?1",
+            [sighting_id],
+        )?;
+        Ok(())
     }
 
     /// Every Word with the sentences and Book names attached to it.
@@ -275,6 +351,22 @@ impl Store {
 
         Ok(corpus)
     }
+}
+
+/// The columns a [`NoteRequest`] is built from, shared by the two queries that
+/// select one so they cannot drift apart.
+const NOTE_REQUEST: &str = "SELECT sightings.id, words.spelling, sightings.sentence, books.name
+       FROM sightings
+       JOIN words ON words.id = sightings.word_id
+       JOIN books ON books.id = sightings.book_id";
+
+fn to_note_request(row: &Row<'_>) -> rusqlite::Result<NoteRequest> {
+    Ok(NoteRequest {
+        sighting_id: row.get(0)?,
+        spelling: row.get(1)?,
+        sentence: row.get(2)?,
+        book_name: row.get(3)?,
+    })
 }
 
 fn to_word(row: &Row<'_>) -> rusqlite::Result<Word> {

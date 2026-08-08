@@ -9,7 +9,9 @@ use ratatui::crossterm::event::KeyCode;
 /// Start with a Book, since every Sighting is attributed to the Current Book.
 fn reading(book: &str) -> Harness {
     let mut vocab = Harness::new();
-    vocab.submit(&format!("/book {book}")).press(KeyCode::Char('y'));
+    vocab
+        .submit(&format!("/book {book}"))
+        .press(KeyCode::Char('y'));
     vocab
 }
 
