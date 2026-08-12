@@ -20,7 +20,7 @@ use anyhow::{Error, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::cards::{BoxedPush, Card, CardSync, Pushed, Unpushed};
+use crate::cards::{BoxedPush, BoxedRemoval, Card, CardSync, Pushed, Removed, Unpushed};
 
 /// AnkiConnect listens here and nowhere else. The literal address rather than
 /// `localhost`, so a machine that resolves that to IPv6 first doesn't pay for a
@@ -69,6 +69,11 @@ impl CardSync for Anki {
                 None => create(&client, &card).await,
             }
         })
+    }
+
+    fn remove(&self, anki_note_id: i64) -> BoxedRemoval {
+        let client = self.client.clone();
+        Box::pin(async move { delete(&client, anki_note_id).await })
     }
 }
 
@@ -149,6 +154,35 @@ async fn update(client: &Client, id: i64, card: &Card) -> Pushed {
     }
 }
 
+/// Take out the note a removed Word left behind.
+///
+/// Anki deletes the cards along with the note, which is the whole point: a Word
+/// the reader has got rid of should stop coming up for review.
+async fn delete(client: &Client, anki_note_id: i64) -> Removed {
+    let asked = ask::<_, ()>(
+        client,
+        Request {
+            action: "deleteNotes",
+            version: PROTOCOL,
+            params: NotesParams {
+                notes: [anki_note_id],
+            },
+        },
+    )
+    .await;
+
+    match asked {
+        Ok(_) => Ok(()),
+        // Already gone — the reader deleted it in Anki themselves. A removal
+        // asks for exactly this state of affairs, so it has got what it came
+        // for; anything else would leave the queue failing the same way for
+        // ever with no way to clear it. The mirror of [`update`], which reads
+        // the same complaint as a reason to write the card back.
+        Err(Unpushed::Refused(complaint)) if note_is_gone(&complaint.to_string()) => Ok(()),
+        Err(unpushed) => Err(unpushed),
+    }
+}
+
 /// Whether Anki's complaint means the note we remember is no longer there.
 ///
 /// AnkiConnect answers with prose rather than a code, so this has to read the
@@ -218,6 +252,13 @@ struct DeckParams<'a> {
 #[derive(Serialize)]
 struct NoteParams<N> {
     note: N,
+}
+
+/// `deleteNotes` takes a list, though we only ever hand it the one — a removal
+/// belongs to one Word, and batching them would lose which of them failed.
+#[derive(Serialize)]
+struct NotesParams {
+    notes: [i64; 1],
 }
 
 #[derive(Serialize)]

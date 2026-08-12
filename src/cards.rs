@@ -10,6 +10,10 @@
 //! gains a Sighting carries the identifier of the note it already has, so the
 //! push updates that card rather than making a second one: recurrence enriches
 //! a card instead of multiplying cards.
+//!
+//! A Word that has been removed is the other half of that mapping: no Word, no
+//! card. Its note is deleted rather than left to be reviewed for ever, and the
+//! deletion queues like a push, so removing a Word with Anki shut costs nothing.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -147,20 +151,42 @@ pub enum Unpushed {
 /// What a push came back with: the Anki note this Word now has.
 pub type Pushed = Result<i64, Unpushed>;
 
+/// What a removal came back with. Nothing to carry — the point of it is that
+/// the note is gone.
+pub type Removed = Result<(), Unpushed>;
+
 /// A card being pushed. Boxed so [`CardSync`] stays usable behind `dyn`.
 pub type BoxedPush = Pin<Box<dyn Future<Output = Pushed> + Send>>;
+
+/// A card being deleted, boxed for the same reason.
+pub type BoxedRemoval = Pin<Box<dyn Future<Output = Removed> + Send>>;
 
 /// Where cards go. The production implementation speaks AnkiConnect; tests
 /// supply a fake, and no test touches the network.
 pub trait CardSync: Send + Sync + 'static {
     fn push(&self, card: Card) -> BoxedPush;
+
+    /// Take out the note a removed Word left behind.
+    ///
+    /// The only thing the sync ever destroys, and it is still one-way: it is
+    /// carrying out a decision made here, not reading one back from Anki.
+    fn remove(&self, anki_note_id: i64) -> BoxedRemoval;
 }
 
-/// One answer, and which Word at which revision it answers for.
-pub struct CardOutcome {
-    pub word_id: i64,
-    pub revision: i64,
-    pub pushed: Pushed,
+/// One answer from Anki, and what it was about.
+///
+/// The two errands a sync runs. Both are the same shape of news — it got there
+/// or it stayed queued — which is why they share a queue, a ration, and the one
+/// deadline on the way out.
+pub enum CardOutcome {
+    /// A card written: which Word, and which revision of it was pushed.
+    Pushed {
+        word_id: i64,
+        revision: i64,
+        pushed: Pushed,
+    },
+    /// A card taken out, and the note it was.
+    Removed { anki_note_id: i64, removed: Removed },
 }
 
 /// The cards being pushed right now.
@@ -192,10 +218,34 @@ impl Cards {
 
     pub fn push(&mut self, card: Card) {
         let sync = self.sync.clone();
-        let handle = self.handle.clone();
-        let turns = self.turns.clone();
         let word_id = card.word_id;
         let revision = card.revision;
+
+        self.run(async move {
+            CardOutcome::Pushed {
+                word_id,
+                revision,
+                pushed: sync.push(card).await,
+            }
+        });
+    }
+
+    /// Delete the card a removed Word left behind in Anki.
+    pub fn remove(&mut self, anki_note_id: i64) {
+        let sync = self.sync.clone();
+
+        self.run(async move {
+            CardOutcome::Removed {
+                anki_note_id,
+                removed: sync.remove(anki_note_id).await,
+            }
+        });
+    }
+
+    /// Put one errand in the air.
+    fn run(&mut self, errand: impl Future<Output = CardOutcome> + Send + 'static) {
+        let handle = self.handle.clone();
+        let turns = self.turns.clone();
 
         self.in_flight.spawn_on(
             async move {
@@ -203,11 +253,7 @@ impl Cards {
                 // batch is spawned at once so that the deadline on the way out
                 // applies to all of it; only the asking is rationed.
                 let _turn = turns.acquire().await;
-                CardOutcome {
-                    word_id,
-                    revision,
-                    pushed: sync.push(card).await,
-                }
+                errand.await
             },
             &handle,
         );
@@ -240,8 +286,8 @@ impl Cards {
     }
 }
 
-/// A push that panicked leaves its Word queued rather than synced, which is the
-/// same place every other failure leaves it.
+/// An errand that panicked leaves its card queued rather than done, which is
+/// the same place every other failure leaves it.
 fn keep(joined: Result<CardOutcome, JoinError>, finished: &mut Vec<CardOutcome>) {
     if let Ok(outcome) = joined {
         finished.push(outcome);

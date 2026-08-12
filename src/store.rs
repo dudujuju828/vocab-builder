@@ -91,6 +91,16 @@ impl Store {
                  changed      INTEGER NOT NULL DEFAULT 1
              );
 
+             -- What Anki is still holding for a Word that no longer exists.
+             -- A removal is queued exactly as a push is, so one made while Anki
+             -- was shut lands on the next Sync rather than being lost. Only a
+             -- Word that had reached Anki leaves a row here: one removed before
+             -- it was ever pushed has no card to delete.
+             CREATE TABLE IF NOT EXISTS removed_cards (
+                 anki_note_id INTEGER PRIMARY KEY,
+                 removed_at   TEXT NOT NULL
+             );
+
              -- Every Word has a row, so the revision above is always a real
              -- number rather than an assumed one. This is also how the backlog
              -- left by v1 and v2 — captured long before there was a sync —
@@ -228,6 +238,42 @@ impl Store {
             word_id,
             sighting_id: self.connection.last_insert_rowid(),
         })
+    }
+
+    /// Forget a Word entirely: the Word, every Sighting on it, and the Notes
+    /// those Sightings carried.
+    ///
+    /// Returns whether the Word left a card behind in Anki. The whole of it is
+    /// one transaction, so the card the Word had is written down as a removal
+    /// in the same breath the Word stops existing — there is no instant in
+    /// which Anki holds a card that nothing here remembers.
+    ///
+    /// A Note still in flight for one of these Sightings is not chased. It
+    /// comes back to a Sighting that is no longer there, which every write
+    /// against it treats as nothing to do.
+    pub fn remove_word(&self, word_id: i64) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
+
+        let anki_note_id: Option<i64> = transaction
+            .query_row(
+                "SELECT anki_note_id FROM sync_state WHERE word_id = ?1",
+                [word_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        if let Some(anki_note_id) = anki_note_id {
+            queue_removal(&transaction, anki_note_id)?;
+        }
+        // Sightings first: the schema has them pointing at the Word, and
+        // foreign keys are on.
+        transaction.execute("DELETE FROM sightings WHERE word_id = ?1", [word_id])?;
+        transaction.execute("DELETE FROM sync_state WHERE word_id = ?1", [word_id])?;
+        transaction.execute("DELETE FROM words WHERE id = ?1", [word_id])?;
+
+        transaction.commit()?;
+        Ok(anki_note_id.is_some())
     }
 
     /// Every Sighting of a Word, most recent first.
@@ -404,12 +450,47 @@ impl Store {
     /// a Sighting captured while the push was in the air leaves it queued, and
     /// the next sync carries what arrived in the meantime.
     pub fn mark_synced(&self, word_id: i64, anki_note_id: i64, revision: i64) -> Result<()> {
-        self.connection.execute(
+        let recorded = self.connection.execute(
             "UPDATE sync_state
                 SET anki_note_id = ?2,
                     changed = CASE WHEN changed = ?3 THEN 0 ELSE changed END
               WHERE word_id = ?1",
             params![word_id, anki_note_id, revision],
+        )?;
+
+        // Every Word has a row, so no row means the Word was removed while its
+        // push was in the air. There is nowhere left to write the identifier,
+        // and Anki has just been handed a card for a Word that no longer
+        // exists — so queue its removal, which is what [`Store::remove_word`]
+        // would have done had the answer arrived before the reader did.
+        if recorded == 0 {
+            queue_removal(&self.connection, anki_note_id)?;
+        }
+        Ok(())
+    }
+
+    /// Every card left behind by a Word that has been removed.
+    ///
+    /// The other half of the sync queue. Ordered by when the Word went, so the
+    /// deck is put right in the order the reader changed their mind.
+    pub fn removed_cards(&self) -> Result<Vec<i64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT anki_note_id FROM removed_cards ORDER BY removed_at, anki_note_id")?;
+        let removals = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(removals)
+    }
+
+    /// Take a card off the removal queue, now that Anki no longer has it.
+    ///
+    /// Only ever called for a deletion that got there. Anything else leaves the
+    /// row where it is, which is the same place a push that didn't go stays.
+    pub fn mark_removed(&self, anki_note_id: i64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM removed_cards WHERE anki_note_id = ?1",
+            [anki_note_id],
         )?;
         Ok(())
     }
@@ -469,6 +550,20 @@ const NOTE_REQUEST: &str = "SELECT sightings.id, words.spelling, sightings.sente
        FROM sightings
        JOIN words ON words.id = sightings.word_id
        JOIN books ON books.id = sightings.book_id";
+
+/// Write down a card Anki is holding for a Word that is gone.
+///
+/// The one place that records this, so the two ways a card is orphaned — the
+/// Word being removed, and a push answering for a Word already removed — cannot
+/// come to disagree about how it is written down. Takes whatever connection the
+/// caller is on, so a removal can queue the deletion inside its own transaction.
+fn queue_removal(connection: &Connection, anki_note_id: i64) -> Result<()> {
+    connection.execute(
+        "INSERT OR IGNORE INTO removed_cards (anki_note_id, removed_at) VALUES (?1, ?2)",
+        params![anki_note_id, now_string()],
+    )?;
+    Ok(())
+}
 
 fn to_note_request(row: &Row<'_>) -> rusqlite::Result<NoteRequest> {
     Ok(NoteRequest {

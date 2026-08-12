@@ -203,10 +203,18 @@ fn draw_word(app: &App, frame: &mut Frame, area: Rect, view: &WordView) {
         lines.push(note_line(sighting, app.notes_are_on()));
     }
 
+    // Two lines rather than one, because they are about two different things:
+    // the first acts on the Sighting under the cursor, the second on the whole
+    // Word. Running them together invited /remove being read as removing the
+    // Sighting you happened to be on.
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
+        "↑↓ to choose a Sighting  ·  /edit its sentence  ·  /explain its Note",
+        DIM,
+    )));
+    lines.push(Line::from(Span::styled(
         format!(
-            "↑↓ to choose a Sighting  ·  /edit its sentence  ·  /explain its Note  ·  {}",
+            "/remove this Word  ·  {}",
             match view.origin {
                 Origin::Search { .. } => "Esc to go back to your search",
                 Origin::Home => "Esc to go back",

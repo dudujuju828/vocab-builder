@@ -39,5 +39,9 @@ _Avoid_: flashcard, entry, note (which is Anki's word for this, and ours for som
 Where Cards land in Anki. Configurable, and `Vocab` unless you say otherwise.
 
 **Sync**:
-Sending every Word whose Card is out of date to Anki. One-way — Vocab to Anki, never back — and it happens on `/sync` and on the way out. One Card within a Sync is *pushed*; the operation as a whole is a Sync and never a push.
+Putting Anki back in step with the Words: every Word whose Card is out of date is sent, and every Card whose Word has been removed is deleted. One-way — Vocab to Anki, never back — and it happens on `/sync` and on the way out. One Card within a Sync is *pushed*, or *removed*; the operation as a whole is a Sync and never a push.
 _Avoid_: upload, export
+
+**Removing**:
+Taking a Word out for good, along with its Sightings and their Notes. The Card goes too, on the next Sync — a Word you have got rid of should stop coming up for review. The only thing the tool does that cannot be undone, which is why it asks first. A Word and its Card are *removed*; *deleted* is reserved for what Anki then does to its own note.
+_Avoid_: deletion, purge, discard

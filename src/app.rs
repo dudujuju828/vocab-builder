@@ -67,6 +67,11 @@ pub const COMMANDS: &[Command] = &[
         help: "write the Note for the Sighting you are on again",
     },
     Command {
+        name: "/remove",
+        argument: "",
+        help: "take out the Word you are on, and its Sightings",
+    },
+    Command {
         name: "/sync",
         argument: "",
         help: "send every Word whose Card has changed to Anki",
@@ -136,6 +141,15 @@ pub enum Prompt {
     AnotherSighting {
         spelling: String,
     },
+    /// Take this Word out for good? Asked because nothing here is recoverable:
+    /// the Sightings go with it, and the sentences were typed by hand.
+    Removal {
+        word_id: i64,
+        spelling: String,
+        /// Carried so the asking can name what goes rather than only the Word,
+        /// which is the part a reader is likely to have forgotten.
+        sightings: usize,
+    },
     /// This Book is not in the Library yet — add it?
     AddBook {
         name: String,
@@ -152,6 +166,14 @@ impl Prompt {
             Self::AnotherSighting { spelling } => {
                 Some(format!("add another Sighting for \"{spelling}\"? [y/n]"))
             }
+            Self::Removal {
+                spelling,
+                sightings,
+                ..
+            } => Some(format!(
+                "remove \"{spelling}\" and its {sightings} {}? [y/n]",
+                plural(*sightings, "Sighting")
+            )),
             Self::AddBook { name } => {
                 Some(format!("\"{name}\" is not in your Library — add it? [y/n]"))
             }
@@ -184,9 +206,15 @@ pub struct Message {
 /// order, and the reader is owed one sentence about the lot of them.
 #[derive(Default, Clone, Copy)]
 struct Syncing {
+    /// Cards written and cards taken out together — both are errands Anki
+    /// either ran or didn't, and the reader is owed one sentence about the lot.
     asked: usize,
+    /// How many of `asked` were removals, which is what decides whether the
+    /// sentence talks about Words or about Cards.
+    removals: usize,
     answered: usize,
     pushed: usize,
+    removed: usize,
     /// Whether anything came back saying Anki wasn't there, which is much the
     /// commonest reason a sync doesn't happen and the one worth naming.
     anki_was_shut: bool,
@@ -380,6 +408,15 @@ impl App {
                     self.inform(Tone::Info, "Left unchanged.");
                 }
             }
+            Prompt::Removal {
+                word_id, spelling, ..
+            } => {
+                if affirmative {
+                    self.remove(word_id, &spelling)?;
+                } else {
+                    self.inform(Tone::Info, format!("\"{spelling}\" was not removed."));
+                }
+            }
             Prompt::AddBook { name } => {
                 if affirmative {
                     let book_id = self.store.add_book(&name)?;
@@ -518,6 +555,7 @@ impl App {
             "/library" => self.show_library(),
             "/edit" => self.edit(),
             "/explain" => self.explain(),
+            "/remove" => self.start_removal(),
             "/sync" => self.sync(),
             "/help" => {
                 self.screen = Screen::Help;
@@ -658,6 +696,63 @@ impl App {
         // reader is already looking at rather than on their next visit.
         self.reread_sightings()?;
         self.inform(Tone::Info, "Sentence corrected.");
+        Ok(())
+    }
+
+    /// Ask whether the Word being looked at should go.
+    ///
+    /// From the Word screen and nowhere else — not `/remove <word>` — because
+    /// nothing here can be got back. The Sightings go with the Word, and their
+    /// sentences were copied out of a book by hand. Reading what is about to be
+    /// lost is the cheapest guard there is against losing the wrong thing.
+    fn start_removal(&mut self) -> Result<()> {
+        let Screen::Word(view) = &self.screen else {
+            self.inform(
+                Tone::Warning,
+                "/remove takes out the Word you are looking at — open one first.",
+            );
+            return Ok(());
+        };
+
+        self.prompt = Prompt::Removal {
+            word_id: view.word.id,
+            spelling: view.word.spelling.clone(),
+            sightings: view.sightings.len(),
+        };
+        Ok(())
+    }
+
+    /// Take a Word out for good.
+    ///
+    /// The Word, its Sightings and their Notes go together — a Sighting without
+    /// its Word is an encounter with nothing. What Anki holds cannot be reached
+    /// from here, so the card is queued for deletion rather than deleted: the
+    /// removal costs nothing with Anki shut, and the deck is put right by the
+    /// next Sync exactly as a capture is.
+    fn remove(&mut self, word_id: i64, spelling: &str) -> Result<()> {
+        let had_a_card = self.store.remove_word(word_id)?;
+        // The Word is gone from what search matches against, and from the count
+        // its Book carries.
+        self.corpus = self.store.corpus()?;
+        self.current_book = self.store.current_book()?;
+
+        // The Screen showing it is now a Screen about nothing, so leave it the
+        // way Escape would. A search is re-run against the corpus above, which
+        // is what drops the Word out of the results behind it.
+        let origin = match &self.screen {
+            Screen::Word(view) => view.origin.clone(),
+            _ => Origin::Home,
+        };
+        self.return_to(origin);
+
+        if had_a_card {
+            self.inform(
+                Tone::Info,
+                format!("Removed \"{spelling}\" — its Card goes on the next Sync."),
+            );
+        } else {
+            self.inform(Tone::Info, format!("Removed \"{spelling}\"."));
+        }
         Ok(())
     }
 
@@ -819,19 +914,20 @@ impl App {
         if asked == 0 {
             self.inform(Tone::Info, "Nothing to sync — Anki is up to date.");
         } else {
-            self.inform(
-                Tone::Info,
-                format!("Syncing {asked} {} to Anki…", plural(asked, "Word")),
-            );
+            let cargo = cargo(asked, self.syncing.removals);
+            self.inform(Tone::Info, format!("Syncing {asked} {cargo} to Anki…"));
         }
         Ok(())
     }
 
-    /// Put every Word whose card is out of date in front of Anki.
+    /// Put every card that no longer matches its Word in front of Anki: the
+    /// ones out of date, and the ones whose Word has gone.
     fn start_sync(&mut self) -> Result<usize> {
         let requests = self.store.changed_cards()?;
+        let removals = self.store.removed_cards()?;
         self.syncing = Syncing {
-            asked: requests.len(),
+            asked: requests.len() + removals.len(),
+            removals: removals.len(),
             ..Syncing::default()
         };
 
@@ -845,7 +941,10 @@ impl App {
                 &sightings,
             ));
         }
-        Ok(requests.len())
+        for anki_note_id in removals {
+            self.cards.remove(anki_note_id);
+        }
+        Ok(self.syncing.asked)
     }
 
     /// Take in every push that has finished. Never waits, so the event loop can
@@ -876,16 +975,34 @@ impl App {
 
         for outcome in finished {
             self.syncing.answered += 1;
-            match outcome.pushed {
-                Ok(anki_note_id) => {
-                    self.store
-                        .mark_synced(outcome.word_id, anki_note_id, outcome.revision)?;
-                    self.syncing.pushed += 1;
-                }
-                // Neither one is recorded against the Word: it stays queued and
-                // the next sync tries again. Only the wording differs.
-                Err(Unpushed::Unavailable(_)) => self.syncing.anki_was_shut = true,
-                Err(Unpushed::Refused(_)) => {}
+            // Nothing that didn't get there is recorded against its card: it
+            // stays queued and the next sync tries again, whether it was a
+            // Word being written or one being taken out. Only the wording
+            // differs, and Anki being shut is much the commonest of the two.
+            match outcome {
+                CardOutcome::Pushed {
+                    word_id,
+                    revision,
+                    pushed,
+                } => match pushed {
+                    Ok(anki_note_id) => {
+                        self.store.mark_synced(word_id, anki_note_id, revision)?;
+                        self.syncing.pushed += 1;
+                    }
+                    Err(Unpushed::Unavailable(_)) => self.syncing.anki_was_shut = true,
+                    Err(Unpushed::Refused(_)) => {}
+                },
+                CardOutcome::Removed {
+                    anki_note_id,
+                    removed,
+                } => match removed {
+                    Ok(()) => {
+                        self.store.mark_removed(anki_note_id)?;
+                        self.syncing.removed += 1;
+                    }
+                    Err(Unpushed::Unavailable(_)) => self.syncing.anki_was_shut = true,
+                    Err(Unpushed::Refused(_)) => {}
+                },
             }
         }
 
@@ -900,7 +1017,9 @@ impl App {
     fn report_sync(&mut self) {
         let Syncing {
             asked,
+            removals,
             pushed,
+            removed,
             anki_was_shut,
             reported,
             ..
@@ -910,35 +1029,43 @@ impl App {
         }
         self.syncing.reported = true;
 
-        // Everything not pushed is queued, whether Anki refused it or never
-        // answered at all — there is nowhere else for it to have gone.
-        let queued = asked.saturating_sub(pushed);
-        let words = plural(queued, "Word");
-        let (tone, text) = match (pushed, queued) {
-            (_, 0) => (
-                Tone::Info,
-                format!("Synced {pushed} {} to Anki.", plural(pushed, "Word")),
+        // What got there. A sync that only wrote cards is the ordinary one and
+        // says so in Words; the moment a removal is in the mix, both halves are
+        // named, because "synced" would quietly cover a card being destroyed.
+        let went = match (pushed, removed) {
+            (0, 0) => String::new(),
+            (_, 0) => format!("Synced {pushed} {} to Anki", plural(pushed, "Word")),
+            (0, _) => format!("Removed {removed} {} from Anki", plural(removed, "Card")),
+            _ => format!(
+                "Synced {pushed} {} and removed {removed} {} in Anki",
+                plural(pushed, "Word"),
+                plural(removed, "Card")
             ),
-            (0, _) if anki_was_shut => (
+        };
+
+        // Everything that didn't get there is queued, whether Anki refused it
+        // or never answered at all — there is nowhere else for it to have gone.
+        let queued = asked.saturating_sub(pushed + removed);
+        let waiting = cargo(queued, removals);
+        let (tone, text) = match (queued, went.is_empty()) {
+            (0, _) => (Tone::Info, format!("{went}.")),
+            (_, true) if anki_was_shut => (
                 Tone::Warning,
                 format!(
-                    "Anki isn't running — {queued} {words} {} queued.",
+                    "Anki isn't running — {queued} {waiting} {} queued.",
                     stays(queued)
                 ),
             ),
-            (0, _) => (
+            (_, true) => (
                 Tone::Warning,
                 format!(
-                    "Nothing went to Anki — {queued} {words} {} queued.",
+                    "Nothing went to Anki — {queued} {waiting} {} queued.",
                     stays(queued)
                 ),
             ),
-            _ => (
+            (_, false) => (
                 Tone::Warning,
-                format!(
-                    "Synced {pushed} of {asked} Words — {queued} {} queued.",
-                    stays(queued)
-                ),
+                format!("{went} — {queued} {waiting} {} queued.", stays(queued)),
             ),
         };
         self.farewell = Some(text.clone());
@@ -1043,6 +1170,17 @@ impl App {
             tone,
         });
     }
+}
+
+/// What a sync is carrying, in the plural the count calls for.
+///
+/// A push is about a Word; a removal is about the Card a Word that no longer
+/// exists left behind, and calling that a Word would name to the reader the very
+/// thing they have just got rid of. So the moment any removal is in the sync,
+/// the whole of it is counted in Cards — which is true of both halves, a Word
+/// being pushed having a Card as well.
+fn cargo(count: usize, removals: usize) -> String {
+    plural(count, if removals == 0 { "Word" } else { "Card" })
 }
 
 /// The completion and argument hint for a partly typed command, shown dimmed

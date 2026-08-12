@@ -26,7 +26,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
-use vocab::cards::{BoxedPush, Card, CardSync, Cards, Unpushed};
+use vocab::cards::{BoxedPush, BoxedRemoval, Card, CardSync, Cards, Unpushed};
 use vocab::config::DEFAULT_DECK;
 use vocab::notes::{BoxedNote, NoteRequest, NoteWriter, Notes, Unwritten};
 use vocab::{App, Config, Dictionary, Store};
@@ -136,10 +136,13 @@ impl NoteWriter for StubWriter {
 ///
 /// It keeps every card it accepted, so a test can read what the tool tried to
 /// write — the Definition, the sentences, the Books, the dates and the Notes —
-/// which is the one part of the tool that has no expression on screen.
+/// which is the one part of the tool that has no expression on screen. It keeps
+/// every note it was told to delete for the same reason: a card removed is a
+/// card that is no longer anywhere to be read.
 pub struct StubAnki {
     behaving: Mutex<Anki>,
     written: Mutex<Vec<Card>>,
+    deleted: Mutex<Vec<i64>>,
     /// Stands in for the identifiers Anki hands back. Arbitrary, except that
     /// each is different from the last.
     next_note_id: AtomicI64,
@@ -150,6 +153,7 @@ impl StubAnki {
         Self {
             behaving: Mutex::new(behaving),
             written: Mutex::new(Vec::new()),
+            deleted: Mutex::new(Vec::new()),
             next_note_id: AtomicI64::new(1_700_000_000_000),
         }
     }
@@ -160,8 +164,20 @@ impl StubAnki {
         *self.behaving.lock().expect("the fake's mode") = Anki::Open;
     }
 
+    /// Close an Anki that was open, which is how the machine usually is between
+    /// one reading session and the next — so a test can reach the state that
+    /// only exists after a card got there: a Word with a card, and no Anki to
+    /// take it back out.
+    fn shuts(&self) {
+        *self.behaving.lock().expect("the fake's mode") = Anki::Shut;
+    }
+
     fn cards(&self) -> Vec<Card> {
         self.written.lock().expect("the fake's record").clone()
+    }
+
+    fn removals(&self) -> Vec<i64> {
+        self.deleted.lock().expect("the fake's record").clone()
     }
 }
 
@@ -189,6 +205,28 @@ impl CardSync for StubAnki {
             }
         };
         Box::pin(async move { pushed })
+    }
+
+    fn remove(&self, anki_note_id: i64) -> BoxedRemoval {
+        let behaving = *self.behaving.lock().expect("the fake's mode");
+
+        let removed = match behaving {
+            Anki::Hanging => return Box::pin(std::future::pending()),
+            Anki::Shut => Err(Unpushed::Unavailable(anyhow::anyhow!(
+                "this fake Anki isn't running"
+            ))),
+            Anki::Refusing => Err(Unpushed::Refused(anyhow::anyhow!(
+                "this fake Anki was asked to refuse"
+            ))),
+            Anki::Open => {
+                self.deleted
+                    .lock()
+                    .expect("the fake's record")
+                    .push(anki_note_id);
+                Ok(())
+            }
+        };
+        Box::pin(async move { removed })
     }
 }
 
@@ -421,6 +459,12 @@ impl Harness {
         self
     }
 
+    /// Close an Anki that has been taking them.
+    pub fn anki_shuts(&mut self) -> &mut Self {
+        self.anki.shuts();
+        self
+    }
+
     pub fn type_text(&mut self, text: &str) -> &mut Self {
         for character in text.chars() {
             self.key(KeyCode::Char(character));
@@ -467,6 +511,11 @@ impl Harness {
     /// Every card the fake Anki accepted, in the order it was handed them.
     pub fn cards(&self) -> Vec<Card> {
         self.anki.cards()
+    }
+
+    /// Every note the fake Anki was told to delete, in the order it was told.
+    pub fn cards_removed(&self) -> Vec<i64> {
+        self.anki.removals()
     }
 
     /// What the tool would print once the terminal was the reader's again.
